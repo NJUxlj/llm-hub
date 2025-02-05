@@ -321,6 +321,7 @@ class SelfAttention(torch.nn.Module):
         super(SelfAttention, self).__init__()
         self.layer_number = max(1, layer_number)
 
+        # model's hidden_size,  if model == bert then hidden_size = 768
         self.projection_size = config.kv_channels * config.num_attention_heads
 
         # Per attention head and per partition values.
@@ -332,6 +333,7 @@ class SelfAttention(torch.nn.Module):
         if self.multi_query_attention:
             self.num_multi_query_groups_per_partition = config.multi_query_group_num
             self.qkv_hidden_size = (
+                    # query.hidden_size  + (key.hidden_size_per_head + value.hidden_size_per_head) * num_multi_query_groups
                     self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num
             )
         self.query_key_value = nn.Linear(config.hidden_size, self.qkv_hidden_size,
