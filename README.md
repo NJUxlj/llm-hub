@@ -1,5 +1,6 @@
 # llm-hub
-it's unfinished
+- it's unfinished
+- 实现了多个主流开源模型的 pre-train + finetune 的流程 (仅使用2000个Question-Answering样本)
 
 
 
