@@ -25,6 +25,7 @@ from transformers.utils import logging
 from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GenerationConfig, ModelOutput
 
+
 from .configuration_chatglm import ChatGLMConfig
 
 # flags required to enable jit fusion kernels
@@ -51,10 +52,26 @@ def default_init(cls, *args, **kwargs):
 
 
 class InvalidScoreLogitsProcessor(LogitsProcessor):
+    '''
+    __call__ 方法是该类的核心方法，当类的实例被调用时会执行此方法。
+
+    参数：
+        input_ids：类型为 torch.LongTensor，表示输入的 token ID。
+        scores：类型为 torch.FloatTensor，表示模型输出的 logits 分数。 shape = [batch_size, seq_len, vocab_size]
+    返回值：
+        类型为 torch.FloatTensor，返回处理后的 logits 分数。
+    '''
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        '''
+        使用 torch.isnan(scores).any() 检查 scores 中是否存在 NaN（Not a Number）值。
+            使用 torch.isinf(scores).any() 检查 scores 中是否存在无穷大（Infinity）值。
+            如果存在 NaN 或无穷大值，则执行以下操作：
+        '''
         if torch.isnan(scores).any() or torch.isinf(scores).any():
-            scores.zero_()
-            scores[..., 5] = 5e4
+            scores.zero_() # 将 scores 中的所有元素置为 0。_ 表示原地操作
+            scores[..., 5] = 5e4 # 将 scores 张量的最后一个维度(vocab_size)的第 5 个元素设置为 5e4
+            
+            # 相当于我强行让模型去预测到词表中的第五个字符。
         return scores
 
 
@@ -677,25 +694,67 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
         return
 
     def get_masks(self, input_ids, past_key_values, padding_mask=None):
+        '''
+        根据输入的 input_ids、past_key_values 和 padding_mask 生成注意力掩码。
+
+        参数:
+        input_ids (torch.Tensor): 输入的 token ID 张量，形状为 [batch_size, seq_length]。
+
+        past_key_values (List[Tuple[Tensor]]): 
+            past_key_values 是一个存储过去的键（key）和值（value）张量的元组列表，
+            通常用于在自回归生成过程中缓存之前步骤的键值对，以避免重复计算。
+
+            past_key_values 是一个长度为 num_layers 的列表，列表中的每个元素是一个元组 (key, value)。
+            key 和 value 的形状均为 (past_length, batch_size, num_heads, head_dim)。
+
+        padding_mask (torch.Tensor or None): 填充掩码张量，如果没有则为 None。
+            shape = (batch_size, seq_length)
+
+        返回:
+        torch.Tensor: 生成的注意力掩码张量，形状为 [batch_size, 1, seq_length, seq_length + past_length]。
+        
+        '''
         batch_size, seq_length = input_ids.shape
-        full_attention_mask = torch.ones(batch_size, seq_length, seq_length, device=input_ids.device)
+        #  创建一个全为 1 的三维张量作为初始的全注意力掩码
+        full_attention_mask = torch.ones(batch_size, seq_length, seq_length, device=input_ids.device) # [batch_size, seq_length, seq_length]  
+        # 将全注意力掩码转换为下三角矩阵，确保每个位置只能关注到其之前的位置
         full_attention_mask.tril_()
+        # 初始化过去序列的长度为 0
         past_length = 0
         if past_key_values:
+            # past_key_values[0][0] 表示第一层的键张量，
+            # 其形状为 (past_length, batch_size, num_heads, head_dim)
             past_length = past_key_values[0][0].shape[0]
         if past_length:
-            full_attention_mask = torch.cat((torch.ones(batch_size, seq_length, past_length,
-                                                        device=input_ids.device), full_attention_mask), dim=-1)
+            # 创建一个全为 1 的三维张量，表示过去序列的注意力掩码
+            past_attention_mask = torch.ones(batch_size, seq_length, past_length, device=input_ids.device)
+            # 将过去序列的注意力掩码和当前序列的注意力掩码在最后一个维度上拼接
+            full_attention_mask = torch.cat((past_attention_mask, full_attention_mask), dim=-1)
+        
         if padding_mask is not None:
+            # # 将填充掩码扩展一个维度，并与全注意力掩码相乘，以应用填充掩码
             full_attention_mask = full_attention_mask * padding_mask.unsqueeze(1)
         if not past_length and padding_mask is not None:
+            # 处理没有历史信息但有填充掩码的情况
             full_attention_mask -= padding_mask.unsqueeze(-1) - 1
-        full_attention_mask = (full_attention_mask < 0.5).bool()
-        full_attention_mask.unsqueeze_(1)
+        full_attention_mask = (full_attention_mask < 0.5).bool() # True值表示该位置的注意力权重会被设为0（即被屏蔽）, False值表示该位置可以参与注意力计算
+        full_attention_mask.unsqueeze_(1) # shape = (batch_size, 1, seq_length, seq_length + past_length)
         return full_attention_mask
+    
+        '''
+        假设 batch_size == 1, 
+        padding_mask = [0, 0, 1]
+        padding_mask.unsqueeze(1) 的结果
+        
+        0 0 1
+        0 0 1
+        1 1 1
+        '''
 
     def get_position_ids(self, input_ids, device):
         batch_size, seq_length = input_ids.shape
+        # 使用 repeat 方法将二维张量在第 0 维上重复 batch_size 次，得到形状为 (batch_size, seq_length) 的二维张量
+        # 这样，每个批次中的序列都有相同的位置编码
         position_ids = torch.arange(seq_length, dtype=torch.long, device=device).unsqueeze(0).repeat(batch_size, 1)
         return position_ids
 

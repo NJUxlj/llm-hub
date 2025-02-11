@@ -17,6 +17,8 @@
 import torch
 from torch import nn
 
+from typing import Optional, List, Tuple, Union
+
 import torch.utils.checkpoint
 
 
@@ -73,10 +75,60 @@ class GlmMLP(nn.Module):
 
 
 
-class GLMBlock(nn.Module):
-    def __init__(self, config: ChatGLMConfig, layer_number, device=None):
+# class GLMBlock(nn.Module):
+#     def __init__(self, config: ChatGLMConfig, layer_number, device=None):
+#         super().__init__()
+#         self.config = config
+#         self.hidden_size = config.hidden_size
+#         self.num_attention_heads = config.num_attention_heads
+
+
+
+
+
+
+
+class GlmAttention(nn.Module):
+    def __init__(self, config:GlmConfig, layer_idx:Optional[int] = None):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
+        self.layer_idx = layer_idx 
+        self.head_dim = getattr(config,"head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim ** -0.5
+        self.attention_dropout = config.attention_dropout
         
+        self.is_casual = True
+        
+        
+    
+    def forward(self):
+        pass
+    
+    
+    
+    
+
+
+
+
+
+class GlmRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        
+    def forward(self, hidden_states):
+        pass
+        
+    
+    
+    
+
+
+class GlmRotaryEmbedding(nn.Module):
+    def __init__(self, config:GlmConfig, device=None):
+        super().__init__()
+
+    
