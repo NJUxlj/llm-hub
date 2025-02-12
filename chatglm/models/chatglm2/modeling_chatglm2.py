@@ -137,6 +137,11 @@ def split_tensor_along_last_dim(
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, original_impl=False, device=None, dtype=None):
+        '''
+        计算逆频率（inverse frequencies）：1.0 / (10000 ** (torch.arange(0, dim, 2) / dim))
+            使用 register_buffer 将 inv_freq 注册为模型的非参数张量
+            这些频率用于生成不同位置的旋转角度
+        '''
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device).to(dtype=dtype) / dim))
         self.register_buffer("inv_freq", inv_freq)
@@ -152,16 +157,20 @@ class RotaryEmbedding(nn.Module):
         transformers/rope/__init__.py. MIT License:
         https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/license.
         """
-        # $\Theta = {\theta_i = 10000^{\frac{2(i-1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
+        # 计算θ值  (频率)
+        # $\Theta = {\theta_i = 10000^{\frac{2(i- 1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
         theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, dtype=dtype, device=device) / n_elem))
 
+        # 创建位置索引
         # Create position indexes `[0, 1, ..., seq_len - 1]`
         seq_idx = torch.arange(seq_len, dtype=dtype, device=device)
 
+        # 计算位置索引和θ的外积 
         # Calculate the product of position index and $\theta_i$
-        idx_theta = torch.outer(seq_idx, theta).float()
+        idx_theta = torch.outer(seq_idx, theta).float() # shape = [seq_len, n_elem]
 
-        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
+        # 计算cos和sin值并堆叠
+        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)  # shape = [seq_len, n_elem, 2]
 
         # this is to mimic the behaviour of complex32, else we will get different results
         if dtype in (torch.float16, torch.bfloat16, torch.int8):
@@ -730,9 +739,12 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
             past_attention_mask = torch.ones(batch_size, seq_length, past_length, device=input_ids.device)
             # 将过去序列的注意力掩码和当前序列的注意力掩码在最后一个维度上拼接
             full_attention_mask = torch.cat((past_attention_mask, full_attention_mask), dim=-1)
-        
+            
+            # 拼接后， shape = (batch_size, seq_length, seq_length + past_length)
+            
         if padding_mask is not None:
             # # 将填充掩码扩展一个维度，并与全注意力掩码相乘，以应用填充掩码
+            # padding_mask 只管当前的序列看不看得到，不会管历史的
             full_attention_mask = full_attention_mask * padding_mask.unsqueeze(1)
         if not past_length and padding_mask is not None:
             # 处理没有历史信息但有填充掩码的情况
@@ -817,11 +829,12 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         self.encoder = init_method(GLMTransformer, config, **init_kwargs)
         self.output_layer = init_method(nn.Linear, config.hidden_size, config.padded_vocab_size, bias=False,
                                         dtype=config.torch_dtype, **init_kwargs)
+        # 前缀序列长度， 用于 p-tuning v2
         self.pre_seq_len = config.pre_seq_len
         self.prefix_projection = config.prefix_projection
         if self.pre_seq_len is not None:
-            for param in self.parameters():
-                param.requires_grad = False
+            for param in self.parameters(): # 冻结 base model 的参数
+                param.requires_grad = False 
             self.prefix_tokens = torch.arange(self.pre_seq_len).long()
             self.prefix_encoder = PrefixEncoder(config)
             self.dropout = torch.nn.Dropout(0.1)
@@ -830,6 +843,11 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         return self.embedding.word_embeddings
 
     def get_prompt(self, batch_size, device, dtype=torch.half):
+        '''
+        用于 P-Tuning v2 中生成连续提示向量
+        将前缀tokens转换为key-value缓存格式
+        返回经过处理的past_key_values用于注意力计算
+        '''
         prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1).to(device)
         past_key_values = self.prefix_encoder(prefix_tokens).type(dtype)
         past_key_values = past_key_values.view(
@@ -855,7 +873,15 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             use_cache: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ):
+    ):  
+        '''
+        input_ids: shape = (batch_size, seq_length)
+        output_hidden_states: 是否返回所有层的隐层状态, shape = (num_layers, batch_size, seq_length, hidden_size)
+        attention_mask: shape = (batch_size, seq_length)
+        full_attention_mask: shape = (batch_size, seq_length, seq_length + past_length)
+        past_key_values: shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
+        inputs_embeds: shape = (batch_size, seq_length, hidden_size)
+        '''
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -867,13 +893,13 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embedding(input_ids)
 
-        if self.pre_seq_len is not None:
+        if self.pre_seq_len is not None: # 使用前缀微调
             if past_key_values is None:
                 past_key_values = self.get_prompt(batch_size=batch_size, device=input_ids.device,
                                                   dtype=inputs_embeds.dtype)
             if attention_mask is not None:
                 attention_mask = torch.cat([attention_mask.new_ones((batch_size, self.pre_seq_len)),
-                                            attention_mask], dim=-1)
+                                            attention_mask], dim=-1) # shape = (batch_size, seq_length + pre_seq_len)
 
         if full_attention_mask is None:
             if (attention_mask is not None and not attention_mask.all()) or (past_key_values and seq_length != 1):
