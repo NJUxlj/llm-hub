@@ -219,8 +219,15 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor):
+        '''
+        hidden_states: [batch_size, seq_length, hidden_size]
+        
+        a_i' = a_i / RMS(a) * g(i), where RMS(a) = sqrt(1/n* sum_{i=1 to n}((a_i)^2))
+        
+        g(i) 在这个类中，就是可训练参数 self.weight
+        '''
         input_dtype = hidden_states.dtype
-        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True) # 1/n * sum(x^2)
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
 
         return (self.weight * hidden_states).to(input_dtype)
