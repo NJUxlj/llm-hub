@@ -87,6 +87,9 @@ class PrefixEncoder(torch.nn.Module):
         self.prefix_projection = config.prefix_projection
         if self.prefix_projection:
             # Use a two-layer MLP to encode the prefix
+            # 用于计算前缀编码所需的键值对（key-value pairs）的总维度大小
+                # config.kv_channels：表示每个键值对的通道数，即每个键或值向量的维度。
+                # kv_size 表示前缀编码所需的键值对的总维度大小。
             kv_size = config.num_layers * config.kv_channels * config.multi_query_group_num * 2
             self.embedding = torch.nn.Embedding(config.pre_seq_len, kv_size)
             self.trans = torch.nn.Sequential(
@@ -99,9 +102,14 @@ class PrefixEncoder(torch.nn.Module):
                                                 config.num_layers * config.kv_channels * config.multi_query_group_num * 2)
 
     def forward(self, prefix: torch.Tensor):
+        '''
+        prefix: [batch_size, prefix_length]
+        
+        output: [batch_size, prefix_length, 2*layers*kv_hidden_size*multi_query_group_num]
+        '''
         if self.prefix_projection:
             prefix_tokens = self.embedding(prefix)
-            past_key_values = self.trans(prefix_tokens)
+            past_key_values = self.trans.forward(prefix_tokens) # [batch_size, prefix_length, 2*layers*kv_hidden_size*multi_query_group_num]
         else:
             past_key_values = self.embedding(prefix)
         return past_key_values
@@ -638,6 +646,11 @@ class GLMTransformer(torch.nn.Module):
             use_cache: Optional[bool] = True,
             output_hidden_states: Optional[bool] = False,
     ):
+        '''
+        hidden_states: aka. last_hidden_states, shape= (batch_size, seq_length, hidden_size)
+
+        kv_caches: aka., past_key_values, shape= (num_layers, 2, batch_size, num_heads, seq_length, head_dim)
+        '''
         if not kv_caches:
             kv_caches = [None for _ in range(self.num_layers)]
         presents = () if use_cache else None
@@ -848,17 +861,18 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         将前缀tokens转换为key-value缓存格式
         返回经过处理的past_key_values用于注意力计算
         '''
-        prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1).to(device)
-        past_key_values = self.prefix_encoder(prefix_tokens).type(dtype)
+        prefix_tokens = self.prefix_tokens.unsqueeze(0).expand(batch_size, -1).to(device) # shape = (batch_size, pre_seq_len)
+        past_key_values:torch.Tensor = self.prefix_encoder.forward(prefix_tokens).type(dtype) # shape = [batch_size, prefix_length, 2*layers*kv_hidden_size*multi_query_group_num]
         past_key_values = past_key_values.view(
             batch_size,
             self.pre_seq_len,
             self.num_layers * 2,
-            self.multi_query_group_num,
-            self.kv_channels
+            self.multi_query_group_num,  # query number
+            self.kv_channels    # kv_hidden_size
         )
         # seq_len, b, nh, hidden_size
         past_key_values = self.dropout(past_key_values)
+        # split(2) 会将这个张量沿着第 0 维分割成多个大小为 2 的子张量，最终返回一个包含这些子张量的元组。
         past_key_values = past_key_values.permute([2, 1, 0, 3, 4]).split(2)
         return past_key_values
 
@@ -877,7 +891,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         '''
         input_ids: shape = (batch_size, seq_length)
         output_hidden_states: 是否返回所有层的隐层状态, shape = (num_layers, batch_size, seq_length, hidden_size)
-        attention_mask: shape = (batch_size, seq_length)
+        attention_mask: 等同于 `padding_mask`, shape = (batch_size, seq_length)
         full_attention_mask: shape = (batch_size, seq_length, seq_length + past_length)
         past_key_values: shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         inputs_embeds: shape = (batch_size, seq_length, hidden_size)
@@ -894,27 +908,30 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             inputs_embeds = self.embedding(input_ids)
 
         if self.pre_seq_len is not None: # 使用前缀微调
-            if past_key_values is None:
+            if past_key_values is None: # 如果 past_key_values 为空，说明还没有生成前缀的键值对。调用 self.get_prompt 方法生成前缀的键值对。
                 past_key_values = self.get_prompt(batch_size=batch_size, device=input_ids.device,
                                                   dtype=inputs_embeds.dtype)
-            if attention_mask is not None:
+            if attention_mask is not None: # 存在 padding_mask
+                # 如果存在padding掩码 attention_mask，则需要将前缀序列的padding掩码（全1）添加到原有的padding掩码中。
                 attention_mask = torch.cat([attention_mask.new_ones((batch_size, self.pre_seq_len)),
                                             attention_mask], dim=-1) # shape = (batch_size, seq_length + pre_seq_len)
 
         if full_attention_mask is None:
+            # padding 掩码存在且非全1， 则需要综合历史序列，当前序列和padding，来生成完整的掩码
             if (attention_mask is not None and not attention_mask.all()) or (past_key_values and seq_length != 1):
                 full_attention_mask = self.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
 
         # Rotary positional embeddings
-        rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
+        rotary_pos_emb = self.rotary_pos_emb(self.seq_length) # shape = (seq_length, hidden_size)
         if position_ids is not None:
             rotary_pos_emb = rotary_pos_emb[position_ids]
         else:
+            # rotary_pos_emb[None, :seq_length] 会选择 rotary_pos_emb 中前 seq_length 个位置的嵌入，并在第0维添加一个维度，形状变为 [1, seq_length, ...]。
             rotary_pos_emb = rotary_pos_emb[None, :seq_length]
         rotary_pos_emb = rotary_pos_emb.transpose(0, 1).contiguous()
 
         # Run encoder.
-        hidden_states, presents, all_hidden_states, all_self_attentions = self.encoder(
+        hidden_states, presents, all_hidden_states, all_self_attentions = self.encoder.forward(
             inputs_embeds, full_attention_mask, rotary_pos_emb=rotary_pos_emb,
             kv_caches=past_key_values, use_cache=use_cache, output_hidden_states=output_hidden_states
         )
