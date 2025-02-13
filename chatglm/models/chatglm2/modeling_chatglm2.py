@@ -243,6 +243,7 @@ class CoreAttention(torch.nn.Module):
             self.attention_softmax_in_fp32 = True
         self.layer_number = max(1, layer_number)
 
+        # 完整的 hidden_size
         projection_size = config.kv_channels * config.num_attention_heads
 
         # Per attention head and per partition values.
@@ -251,7 +252,7 @@ class CoreAttention(torch.nn.Module):
         self.num_attention_heads_per_partition = config.num_attention_heads
 
         coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head) # 根号 d_k
         if self.apply_query_key_layer_scaling:
             coeff = self.layer_number
             self.norm_factor *= coeff
