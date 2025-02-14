@@ -88,7 +88,7 @@ class PrefixEncoder(torch.nn.Module):
         if self.prefix_projection:
             # Use a two-layer MLP to encode the prefix
             # 用于计算前缀编码所需的键值对（key-value pairs）的总维度大小
-                # config.kv_channels：表示每个键值对的通道数，即每个键或值向量的维度。
+                # config.kv_channels：即，kv_head_size, 表示每个键值对的通道数，即每个键或值向量的维度。
                 # kv_size 表示前缀编码所需的键值对的总维度大小。
             kv_size = config.num_layers * config.kv_channels * config.multi_query_group_num * 2
             self.embedding = torch.nn.Embedding(config.pre_seq_len, kv_size)
@@ -164,6 +164,15 @@ class RotaryEmbedding(nn.Module):
         Derived from: https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/
         transformers/rope/__init__.py. MIT License:
         https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/license.
+
+
+        Args:
+            seq_len: sequence length of the input
+            n_elem: number of elements in each sequence
+            dtype: data type of the input
+        
+        returns:
+            torch.Tensor: [seq_len, n_elem]
         """
         # 计算θ值  (频率)
         # $\Theta = {\theta_i = 10000^{\frac{2(i- 1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
@@ -191,24 +200,53 @@ class RotaryEmbedding(nn.Module):
         )
 
 
-@torch.jit.script
+@torch.jit.script   # 这意味着该函数会被编译成 TorchScript，以提高运行效率
 def apply_rotary_pos_emb(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
+    '''
+    此函数的主要作用是将旋转位置编码（Rotary Position Embedding，ROPE）应用到输入张量 x 上。
+
+    rope_cache: 旋转位置编码缓存，用于存储预先计算好的旋转位置编码
+        rope_cache.shape = (seq_length, 1, hidden_size) 
+    
+    x: [sq, b, np, hn]
+        x.shape = [sq, b, np, hn]
+        sq: 序列长度（sequence length）
+        b: 批次大小（batch size）
+        np: 注意力头数（number of heads）
+        hn: 隐藏层维度（hidden layer dimension）
+    函数的执行过程如下：
+        首先，将输入张量 x 的最后一个维度（hn）拆分为两个部分：rot_dim 和 x_pass。
+        rot_dim 表示需要应用旋转位置编码的维度，而 x_pass 表示不需要应用旋转位置编码的维度。
+
+    '''
     # x: [sq, b, np, hn]
     sq, b, np, hn = x.size(0), x.size(1), x.size(2), x.size(3)
-    rot_dim = rope_cache.shape[-2] * 2
+    rot_dim = rope_cache.shape[-2] * 2 # 确定 旋转维度 == 注意力头数 * 2
+    
+    '''
+    x：取输入张量 x 的前 rot_dim 个维度，用于应用旋转位置编码。
+    x_pass：取输入张量 x 剩余的维度，这些维度不应用旋转位置编码。
+    '''
     x, x_pass = x[..., :rot_dim], x[..., rot_dim:]
     # truncate to support variable sizes
     rope_cache = rope_cache[:sq]
     xshaped = x.reshape(sq, -1, np, rot_dim // 2, 2)
-    rope_cache = rope_cache.view(sq, -1, 1, xshaped.size(3), 2)
+    rope_cache = rope_cache.view(sq, -1, 1, xshaped.size(3), 2) # shape = [sq, b, 1, np, 2]
+    
+    # rope_cache[..., 0] 代表 cosθ
+    # rope_cache[..., 1] 代表 sinθ
+    
+    # xshaped[..., 0] 代表 复数 a+bi  的实部 a
+    # xshaped[..., 1] 代表 复数 a+bi   的虚部 b
+    
     x_out2 = torch.stack(
-        [
+        [  
             xshaped[..., 0] * rope_cache[..., 0] - xshaped[..., 1] * rope_cache[..., 1],
             xshaped[..., 1] * rope_cache[..., 0] + xshaped[..., 0] * rope_cache[..., 1],
         ],
         -1,
-    )
-    x_out2 = x_out2.flatten(3)
+    ) # x_out2.shape = [sq, b, np, hn/2, 2]
+    x_out2 = x_out2.flatten(3) #  展平旋转后的维度  shape = [sq, b, np, hn]
     return torch.cat((x_out2, x_pass), dim=-1)
 
 
@@ -291,6 +329,9 @@ class CoreAttention(torch.nn.Module):
             context_layer = context_layer.reshape(*new_context_layer_shape)
         else:
             # Raw attention scores
+            
+            # query_layer: [seq_length, batch_size, num_head, head_size]
+            # key_layer: [seq_length, batch_size, num_head, head_size]
 
             # [b, np, sq, sk] = [batch_size, num_partitions, seq_len_query, seq_len_key]  注：num_partitions == num_attention_heads
             output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
@@ -347,6 +388,9 @@ class CoreAttention(torch.nn.Module):
 
             # value_layer -> context layer.
             # [sk, b, np, hn] --> [b, np, sq, hn]
+            
+            # query_layer.shape = [sq, b, np, hn]    [sq, b * np, hn]
+            # value_layer.shape = [sk, b, np, hn]    [sk, b * np, hn]
 
             # context layer shape: [b, np, sq, hn]
             output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
@@ -422,6 +466,9 @@ class SelfAttention(torch.nn.Module):
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True
     ):
+        '''
+        rotary_pos_emb: shape = (seq_length, 1, hidden_size)
+        '''
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -431,7 +478,8 @@ class SelfAttention(torch.nn.Module):
         # Query, Key, and Value
         # =====================
 
-        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]   
+        # 准确来说是 [seq_len, batch_size, num_partitions * (query_hidden_size + key_hidden_size + value_hidden_size)]
         mixed_x_layer = self.query_key_value(hidden_states)
 
         if self.multi_query_attention:
@@ -443,6 +491,11 @@ class SelfAttention(torch.nn.Module):
                 ],
                 dim=-1,
             )
+            '''
+            query_layer.shape = [seq_len, batch_size, num_attention_heads_per_partition * hidden_size_per_attention_head]
+            key_layer.shape = [seq_len, batch_size, num_multi_query_groups_per_partition * hidden_size_per_attention_head]
+            value_layer.shape = [seq_len, batch_size, num_multi_query_groups_per_partition * hidden_size_per_attention_head]
+            '''
             query_layer = query_layer.view(
                 query_layer.size()[:-1] + (self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
             )
@@ -477,14 +530,20 @@ class SelfAttention(torch.nn.Module):
         else:
             kv_cache = None
 
-        if self.multi_query_attention:
-            key_layer = key_layer.unsqueeze(-2)
-            key_layer = key_layer.expand(
+        if self.multi_query_attention: # 复制key和value, 使得 key-value pair的数量 == query的数量
+            key_layer = key_layer.unsqueeze(-2) # [seq_len, batch_size, num_multi_query_groups_per_partition, 1, hidden_size_per_attention_head]
+            
+            key_layer = key_layer.expand(  # 这样做的目的是为了让每个查询头都能对应一个键头。
                 -1, -1, -1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, -1
-            )
-            key_layer = key_layer.contiguous().view(
+            ) 
+            
+            # self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition 表示每个组内有多少query头
+            
+            # 由于， num_multi_query_groups * num_heads // num_multi_query_groups = num_heads
+            key_layer = key_layer.contiguous().view( # 将扩展后的 key_layer 重新调整形状，使其与 query_layer 的形状一致
                 key_layer.size()[:2] + (self.num_attention_heads_per_partition, self.hidden_size_per_attention_head)
-            )
+            ) # shape = [seq_len, batch_size, num_attention_heads_per_partition, hidden_size_per_attention_head]
+            
             value_layer = value_layer.unsqueeze(-2)
             value_layer = value_layer.expand(
                 -1, -1, -1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, -1
@@ -497,7 +556,7 @@ class SelfAttention(torch.nn.Module):
         # core attention computation
         # ==================================
 
-        context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
+        context_layer = self.core_attention.forward(query_layer, key_layer, value_layer, attention_mask)
 
         # =================
         # Output. [sq, b, h] = [seq_length, batch_size, hidden_size]
@@ -595,12 +654,15 @@ class GLMBlock(torch.nn.Module):
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True,
     ):
+        '''
+        rotary_pos_emb: shape = (seq_length, 1, hidden_size)
+        '''
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
-        attention_output, kv_cache = self.self_attention(
+        attention_output, kv_cache = self.self_attention.forward(
             layernorm_output,
             attention_mask,
             rotary_pos_emb,
@@ -673,10 +735,12 @@ class GLMTransformer(torch.nn.Module):
         hidden_states: aka. last_hidden_states, shape= (batch_size, seq_length, hidden_size)
 
         kv_caches: aka., past_key_values, shape= (num_layers, 2, batch_size, num_heads, seq_length, head_dim)
+
+        rotary_pos_emb: shape = (seq_length, 1, hidden_size)
         '''
         if not kv_caches:
             kv_caches = [None for _ in range(self.num_layers)]
-        presents = () if use_cache else None
+        presents = () if use_cache else None # 每一层的 kv-cache 的集合
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -732,7 +796,6 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
     An abstract class to handle weights initialization and
     a simple interface for downloading and loading pretrained models.
     """
-
     is_parallelizable = False
     supports_gradient_checkpointing = True
     config_class = ChatGLMConfig
@@ -784,7 +847,7 @@ class ChatGLMPreTrainedModel(PreTrainedModel):
             # 拼接后， shape = (batch_size, seq_length, seq_length + past_length)
             
         if padding_mask is not None:
-            # # 将填充掩码扩展一个维度，并与全注意力掩码相乘，以应用填充掩码
+            # 将填充掩码扩展一个维度，并与全注意力掩码相乘，以应用填充掩码
             # padding_mask 只管当前的序列看不看得到，不会管历史的
             full_attention_mask = full_attention_mask * padding_mask.unsqueeze(1)
         if not past_length and padding_mask is not None:
@@ -833,6 +896,9 @@ class Embedding(torch.nn.Module):
         self.fp32_residual_connection = config.fp32_residual_connection
 
     def forward(self, input_ids):
+        '''
+        return embeddings, shape = [seq_len, batch_size, hidden_size]
+        '''
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
         embeddings = words_embeddings
@@ -857,14 +923,14 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         self.embedding = init_method(Embedding, config, **init_kwargs)
         self.num_layers = config.num_layers
         self.multi_query_group_num = config.multi_query_group_num
-        self.kv_channels = config.kv_channels
+        self.kv_channels = config.kv_channels  # key, value 的 head_size
 
         # Rotary positional embeddings
         self.seq_length = config.seq_length
         rotary_dim = (
             config.hidden_size // config.num_attention_heads if config.kv_channels is None else config.kv_channels
         )
-
+        # why rotary_dim // 2 ? 因为 我们把 样本 x 的 hidden_size 分成了偶数和奇数维， 取的时候实际: x_{2k}, x_{2k+b}, 分别作为复数向量的实部和虚部
         self.rotary_pos_emb = RotaryEmbedding(rotary_dim // 2, original_impl=config.original_rope, device=device,
                                               dtype=config.torch_dtype)
         self.encoder = init_method(GLMTransformer, config, **init_kwargs)
@@ -895,8 +961,8 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             batch_size,
             self.pre_seq_len,
             self.num_layers * 2,
-            self.multi_query_group_num,  # query number
-            self.kv_channels    # kv_hidden_size
+            self.multi_query_group_num,  # key-value pairs number
+            self.kv_channels    # kv_head_size
         )
         # seq_len, b, nh, hidden_size
         past_key_values = self.dropout(past_key_values)
@@ -955,10 +1021,11 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             rotary_pos_emb = rotary_pos_emb[position_ids]
         else:
             # rotary_pos_emb[None, :seq_length] 会选择 rotary_pos_emb 中前 seq_length 个位置的嵌入，并在第0维添加一个维度，形状变为 [1, seq_length, ...]。
-            rotary_pos_emb = rotary_pos_emb[None, :seq_length]
-        rotary_pos_emb = rotary_pos_emb.transpose(0, 1).contiguous()
+            rotary_pos_emb = rotary_pos_emb[None, :seq_length] # shape = (1, seq_length, hidden_size)
+        rotary_pos_emb = rotary_pos_emb.transpose(0, 1).contiguous() # shape = (seq_length, 1, hidden_size)
 
         # Run encoder.
+        # presents： 如果 use_cache=True，则返回一个元组，其中包含每个编码器层的键值对缓存。
         hidden_states, presents, all_hidden_states, all_self_attentions = self.encoder.forward(
             inputs_embeds, full_attention_mask, rotary_pos_emb=rotary_pos_emb,
             kv_caches=past_key_values, use_cache=use_cache, output_hidden_states=output_hidden_states
@@ -1236,7 +1303,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
                 " recommend using `max_new_tokens` to control the maximum length of the generation.",
                 UserWarning,
-            )
+            ) # 这里的作用是将generation_config.max_length设置为generation_config.max_new_tokens + input_ids_seq_length
         elif generation_config.max_new_tokens is not None:
             generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
             if not has_default_max_length:
@@ -1313,10 +1380,13 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 break
 
     def quantize(self, bits: int, empty_init=False, device=None, **kwargs):
+        '''
+        quantization 包已经过时了， 我们直接忽略这个函数
+        '''
         if bits == 0:
             return
 
-        from .quantization import quantize
+        from .quantization import quantize  
 
         if self.quantized:
             logger.info("Already quantized.")
