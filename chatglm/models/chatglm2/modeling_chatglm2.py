@@ -255,33 +255,47 @@ class CoreAttention(torch.nn.Module):
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head) # 根号 d_k
         if self.apply_query_key_layer_scaling:
             coeff = self.layer_number
-            self.norm_factor *= coeff
+            self.norm_factor *= coeff  # 根号 d_k * 层数
         self.coeff = coeff
 
         self.attention_dropout = torch.nn.Dropout(config.attention_dropout)
 
     def forward(self, query_layer, key_layer, value_layer, attention_mask):
+        '''
+        query_layer: [seq_length, batch_size, num_head, head_size]
+        key_layer: [seq_length, batch_size, num_head, head_size]
+        
+        torch.nn.functional.scaled_dot_product_attention 已经是 PyTorch 2.0 提供的高效实现，一般不需要额外的性能优化。
+        '''
         pytorch_major_version = int(torch.__version__.split('.')[0])
         if pytorch_major_version >= 2:
+            # 将 query_layer, key_layer, value_layer 的维度进行重排
             query_layer, key_layer, value_layer = [k.permute(1, 2, 0, 3) for k in [query_layer, key_layer, value_layer]]
             if attention_mask is None and query_layer.shape[2] == key_layer.shape[2]:
+                # 使用 scaled_dot_product_attention 函数计算上下文层，开启因果掩码
                 context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer, key_layer, value_layer,
                                                                                  is_causal=True)
             else:
                 if attention_mask is not None:
+                    # 如果提供了注意力掩码，将其取反
                     attention_mask = ~attention_mask
                 context_layer = torch.nn.functional.scaled_dot_product_attention(query_layer, key_layer, value_layer,
-                                                                                 attention_mask)
+                                                                                                    attention_mask)
+            # 将上下文层的维度进行重排，恢复到原始的维度顺序
+            #  context_layer 在调用 permute 之前的形状为 [batch_size, num_head, seq_length, head_size]。
+            # 重排后形状: [seq_length, batch_size, num_head, head_size]                                                                     
             context_layer = context_layer.permute(2, 0, 1, 3)
+            # 取 context_layer 形状的前两个维度，然后将 self.hidden_size_per_partition 作为最后一个维度添加进去。
+            # new_context_layer_shape 为 (seq_length, batch_size, self.hidden_size_per_partition)。
             new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
             context_layer = context_layer.reshape(*new_context_layer_shape)
         else:
             # Raw attention scores
 
-            # [b, np, sq, sk]
+            # [b, np, sq, sk] = [batch_size, num_partitions, seq_len_query, seq_len_key]  注：num_partitions == num_attention_heads
             output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
 
-            # [sq, b, np, hn] -> [sq, b * np, hn]
+            # [sq, b, np, hn] -> [sq, b * np, hn] = [seq_len_query, batch_size * num_partitions, head_size]
             query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
             # [sk, b, np, hn] -> [sk, b * np, hn]
             key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
@@ -315,10 +329,11 @@ class CoreAttention(torch.nn.Module):
                 attention_scores = attention_scores * self.coeff
             if attention_mask is None and attention_scores.shape[2] == attention_scores.shape[3]:
                 attention_mask = torch.ones(output_size[0], 1, output_size[2], output_size[3],
-                                            device=attention_scores.device, dtype=torch.bool)
-                attention_mask.tril_()
-                attention_mask = ~attention_mask
+                                            device=attention_scores.device, dtype=torch.bool) # shape = [batch_size, 1, seq_len_query, seq_len_key]
+                attention_mask.tril_() # 下三角全1
+                attention_mask = ~attention_mask #下三角全0， 上三角全1
             if attention_mask is not None:
+                # 矩阵中为True的地方填充给定值 "-inf"
                 attention_scores = attention_scores.masked_fill(attention_mask, float("-inf"))
             attention_probs = F.softmax(attention_scores, dim=-1)
             attention_probs = attention_probs.type_as(value_layer)
@@ -327,7 +342,7 @@ class CoreAttention(torch.nn.Module):
             # seem a bit unusual, but is taken from the original Transformer paper.
             attention_probs = self.attention_dropout(attention_probs)
             # =========================
-            # Context layer. [sq, b, hp]
+            # Context layer. [sq, b, hp]   , hp = num_heads * head_size
             # =========================
 
             # value_layer -> context layer.
@@ -355,7 +370,7 @@ class CoreAttention(torch.nn.Module):
 class SelfAttention(torch.nn.Module):
     """Parallel self-attention layer abstract class.
 
-    Self-attention layer takes input with size [s, b, h]
+    Self-attention layer takes input with size [s, b, h] = [seq_length, batch_size, hidden_size]
     and returns output of the same size.
     """
 
@@ -374,7 +389,7 @@ class SelfAttention(torch.nn.Module):
         self.qkv_hidden_size = 3 * self.projection_size
         if self.multi_query_attention:
             self.num_multi_query_groups_per_partition = config.multi_query_group_num
-            self.qkv_hidden_size = (
+            self.qkv_hidden_size = ( # 包含所有 qkv 注意力头的隐单元维度， 假设一共可以分成8个头，那么query占8个头，kv分别只占了1个头 （如果group_num == 1)
                     # query.hidden_size  + (key.hidden_size_per_head + value.hidden_size_per_head) * num_multi_query_groups
                     self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num
             )
@@ -485,7 +500,7 @@ class SelfAttention(torch.nn.Module):
         context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
 
         # =================
-        # Output. [sq, b, h]
+        # Output. [sq, b, h] = [seq_length, batch_size, hidden_size]
         # =================
 
         output = self.dense(context_layer)
@@ -538,7 +553,7 @@ class MLP(torch.nn.Module):
         )
 
     def forward(self, hidden_states):
-        # [s, b, 4hp]
+        # [s, b, 4hp] = [seq_length, batch_size, 4*hidden_size]
         intermediate_parallel = self.dense_h_to_4h(hidden_states)
         intermediate_parallel = self.activation_func(intermediate_parallel)
         # [s, b, h]
@@ -675,7 +690,12 @@ class GLMTransformer(torch.nn.Module):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            layer = self._get_layer(index)
+            layer:GLMBlock = self._get_layer(index)
+            
+            '''
+            checkpoint: 传播所需的张量一直保持到它们在梯度计算中被使用，而是在检查点区域的正向计算中省略为反向传播保存张量，
+                并在反向传播过程中重新计算它们。激活检查点可以应用于模型的任何部分。
+            '''
             if self.gradient_checkpointing and self.training:
                 layer_ret = torch.utils.checkpoint.checkpoint(
                     layer,
@@ -686,7 +706,7 @@ class GLMTransformer(torch.nn.Module):
                     use_cache
                 )
             else:
-                layer_ret = layer(
+                layer_ret = layer.forward(
                     hidden_states,
                     attention_mask,
                     rotary_pos_emb,
