@@ -20,7 +20,7 @@ from typing import Optional, Tuple, TypedDict
 import torch
 import torch.nn.functional as F
 
-from . import is_flash_attn_2_available, is_flash_attn_greater_or_equal, logging
+from .utils import is_flash_attn_2_available, is_flash_attn_greater_or_equal, logging
 
 
 logger = logging.get_logger(__name__)

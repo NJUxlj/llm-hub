@@ -29,20 +29,20 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
-from ...modeling_attn_mask_utils import (
+from ..my_transformers.activations import ACT2FN
+from ..my_transformers.cache_utils import Cache, DynamicCache
+from ..my_transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
-from ...modeling_outputs import (
+from ..my_transformers.modeling_outputs import (
     MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
-from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import is_torch_greater_or_equal_than_1_13
-from ...utils import (
+from ..my_transformers.modeling_utils import PreTrainedModel
+from ..my_transformers.pytorch_utils import is_torch_greater_or_equal_than_1_13
+from ..my_transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
@@ -50,7 +50,7 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-from ...utils.import_utils import is_torch_fx_available
+from ..my_transformers.utils.import_utils import is_torch_fx_available
 from .configuration_mixtral import MixtralConfig
 
 

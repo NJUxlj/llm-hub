@@ -656,6 +656,8 @@ class GLMBlock(torch.nn.Module):
     ):
         '''
         rotary_pos_emb: shape = (seq_length, 1, hidden_size)
+        
+        hidden_states: [s, b, h]
         '''
         # hidden_states: [s, b, h]
 
@@ -989,6 +991,13 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         full_attention_mask: shape = (batch_size, seq_length, seq_length + past_length)
         past_key_values: shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
         inputs_embeds: shape = (batch_size, seq_length, hidden_size)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,  shape = (seq_length, batch_size, hidden_size)
+            past_key_values=presents,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
         '''
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1133,7 +1142,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        transformer_outputs = self.transformer(
+        transformer_outputs = self.transformer.forward(
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -1144,11 +1153,11 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             return_dict=return_dict,
         )
 
-        hidden_states = transformer_outputs[0]
+        hidden_states = transformer_outputs[0] #shape = [seq_length, batch_size, hidden_size]
         if return_last_logit:
-            hidden_states = hidden_states[-1:]
-        lm_logits = self.transformer.output_layer(hidden_states)
-        lm_logits = lm_logits.transpose(0, 1).contiguous()
+            hidden_states = hidden_states[-1:]  # 只取最后一个输出 shape = [1, batch_size, hidden_size]
+        lm_logits = self.transformer.output_layer(hidden_states) # shape = [seq_length, batch_size, vocab_size]
+        lm_logits = lm_logits.transpose(0, 1).contiguous() # shape = [batch_size, seq_length, vocab_size]
 
         loss = None
         if labels is not None:

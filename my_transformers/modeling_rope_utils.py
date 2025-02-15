@@ -15,8 +15,8 @@
 import math
 from typing import Optional, Tuple
 
-from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import is_torch_available, logging
+from .configuration_utils import PretrainedConfig
+from .utils import is_torch_available, logging
 
 
 logger = logging.get_logger(__name__)
