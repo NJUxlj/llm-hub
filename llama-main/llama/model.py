@@ -177,11 +177,105 @@ def apply_rotary_emb(
     returned as real tensors.
 
     Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+        xq (torch.Tensor): Query tensor to apply rotary embeddings. shape= [batch_size, seq_len, n_heads, head_dim]
+        xk (torch.Tensor): Key tensor to apply rotary embeddings. shape= [batch_size, seq_len, n_heads, head_dim]
+        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials. shape = [seq_len, dim//2]
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
 
+        return xq, xk, where xq.shape == xk.shape [batch_size, seq_len, n_heads, head_dim]
+
     """
+    # 首先将query和key张量重塑并转换为复数形式。这里通过`reshape(*xq.shape[:-1], -1, 2)`将最后一个维度每两个数字组合成一个复数，其中:
+    # - 实部和虚部分别对应embedding维度中相邻的两个值
+        # 每对相邻的实数 $(x, y)$ 被视为一个复数 $z = x + yi$
+        # 这种表示便于后续进行复数乘法（旋转操作）
+    # - `view_as_complex`将这些数对解释为复数
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_) # [1, seq_len, 1, head_dim//2]
+    
+    # 应用旋转
+    # xq_.shape = [batch_size, seq_len, n_heads, head_dim//2, 2]
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)   # 对位相乘， 然后将复数转回实数对， 然后 flatten(3) 将最后两个维度合并
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    
+    # - 通过复数乘法实现旋转变换
+    # - `view_as_real`将结果转回实数域
+    # - `flatten(3)`将最后两个维度压缩回原始形状 
+
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+    
+    
+    
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+
+
+
+
+
+class Attention(nn.Module):
+    """Multi-head attention module."""
+    def __init__(self, args: ModelArgs):
+        """
+        Initialize the Attention module.
+
+        Args:
+            args (ModelArgs): Model configuration parameters.
+
+        Attributes:
+            n_kv_heads (int): Number of key and value heads.
+            n_local_heads (int): Number of local query heads.
+            n_local_kv_heads (int): Number of local key and value heads.
+            n_rep (int): Number of repetitions for local heads.
+            head_dim (int): Dimension size of each attention head.
+            wq (ColumnParallelLinear): Linear transformation for queries.
+            wk (ColumnParallelLinear): Linear transformation for keys.
+            wv (ColumnParallelLinear): Linear transformation for values.
+            wo (RowParallelLinear): Linear transformation for output.
+            cache_k (torch.Tensor): Cached keys for attention.
+            cache_v (torch.Tensor): Cached values for attention.
+
+        """
+        super().__init__()
+        
+        
+    
+    
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position for caching.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor. [cosine, sine]
+            mask (torch.Tensor, optional): Attention mask tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        
+        
+        
+        # repeat k/v heads if n_kv_heads < n_heads
