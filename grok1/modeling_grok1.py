@@ -337,9 +337,13 @@ class DecoderLayer(nn.Module):
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
+        '''
+        ## Args:
+            hidden_states: (batch_size, sequence_length, hidden_size)。
+        '''
         residual = hidden_states
         hidden_states = self.pre_attn_norm(hidden_states)
-        hidden_states, attention_weights, present_key_value = self.attn(
+        hidden_states, attention_weights, present_key_value = self.attn.forward(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -352,6 +356,13 @@ class DecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.pre_moe_norm(hidden_states)
+        
+        '''
+        router_logits 是在混合专家（Mixture of Experts, MoE）模块中，
+            由门控网络（gate network）输出的对数概率值，
+            用于决定每个输入样本应该路由到哪些专家网络。
+            其形状通常为 (batch_size, sequence_length, num_experts)。
+        '''
         hidden_states, router_logits = self.moe_block(hidden_states)
         hidden_states = self.post_moe_norm(hidden_states)
         hidden_states = residual + hidden_states
