@@ -26,16 +26,16 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
-from .utils.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.utils.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
-from .utils.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from .utils.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from .utils.processing_utils import Unpack
+from transformers.utils.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.utils.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.utils.processing_utils import Unpack
 from transformers.utils import (
     LossKwargs,
     add_code_sample_docstrings,
@@ -44,7 +44,7 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from .utils.deprecation import deprecate_kwarg
+from transformers.utils.deprecation import deprecate_kwarg
 from .configuration_glm4 import GlmConfig
 
 

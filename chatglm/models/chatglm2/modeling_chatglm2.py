@@ -55,13 +55,16 @@ def default_init(cls, *args, **kwargs):
 
 class InvalidScoreLogitsProcessor(LogitsProcessor):
     '''
-    __call__ 方法是该类的核心方法，当类的实例被调用时会执行此方法。
+    ## function:
+        用于处理模型输出的 logits 分数，将其中的 NaN 和无穷大值替换为 0，并将最后一个维度的第 5 个元素设置为 5e4。相当于我强行让模型去预测到词表中的第五个字符。
 
-    参数：
+    ## Args:
         input_ids：类型为 torch.LongTensor，表示输入的 token ID。
         scores：类型为 torch.FloatTensor，表示模型输出的 logits 分数。 shape = [batch_size, seq_len, vocab_size]
-    返回值：
+    ## return：
         类型为 torch.FloatTensor，返回处理后的 logits 分数。
+        
+    __call__ 方法是该类的核心方法，当类的实例被调用时会执行此方法。
     '''
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         '''
