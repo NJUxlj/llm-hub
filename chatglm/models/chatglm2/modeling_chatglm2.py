@@ -1081,6 +1081,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         )
 
         # update attention mask
+        # attention_mask.shape = (batch_size, seq_length)
+        # 如果 model_kwargs 中包含 attention_mask，则在其末尾添加一个全为 1 的列，以适应新生成的 token。
         if "attention_mask" in model_kwargs:
             attention_mask = model_kwargs["attention_mask"]
             model_kwargs["attention_mask"] = torch.cat(
@@ -1088,15 +1090,17 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             )
 
         # update position ids
+        # position_ids.shape = (batch_size, seq_length)
+        # 如果 model_kwargs 中包含 position_ids，则复制最后一个位置 ID 并加 1，然后将其添加到 position_ids 的末尾。
         if "position_ids" in model_kwargs:
             position_ids = model_kwargs["position_ids"]
-            new_position_id = position_ids[..., -1:].clone()
+            new_position_id = position_ids[..., -1:].clone()  # shape = (batch_size, 1)
             new_position_id += 1
             model_kwargs["position_ids"] = torch.cat(
                 [position_ids, new_position_id], dim=-1
             )
 
-        model_kwargs["is_first_forward"] = False
+        model_kwargs["is_first_forward"] = False  # 表示不是第一次前向传播
         return model_kwargs
 
     def prepare_inputs_for_generation(
