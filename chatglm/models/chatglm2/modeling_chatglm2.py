@@ -15,6 +15,8 @@ from torch.nn import CrossEntropyLoss, LayerNorm, MSELoss, BCEWithLogitsLoss
 from torch.nn.utils import skip_init
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any
 
+from transformers import AutoTokenizer
+
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -1117,7 +1119,14 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         if position_ids is None:
             position_ids = self.get_position_ids(input_ids, device=input_ids.device)
         if not is_first_forward:
-            if past_key_values is not None:
+            '''
+            在生成过程中，当past_key_values存在时，模型已经处理过前面的序列，
+                并且缓存了对应的key和value。此时，模型只需要处理最新的token，
+                所以仅需获取这个最新token的位置信息。
+                
+            此时，attention中的 query 只包含最后一个token的嵌入，不会包含 past_key_values
+            '''
+            if past_key_values is not None: # 只取 position_ids 和 input_ids 的最后一个元素。
                 position_ids = position_ids[..., -1:]
                 input_ids = input_ids[:, -1:]
         return {
@@ -1143,6 +1152,10 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             return_dict: Optional[bool] = None,
             return_last_logit: Optional[bool] = False,
     ):
+        '''
+        input_ids.shape = (batch_size, seq_length)
+        labels.shape = (batch_size, seq_length)
+        '''
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1158,18 +1171,24 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         )
 
         hidden_states = transformer_outputs[0] #shape = [seq_length, batch_size, hidden_size]
-        if return_last_logit:
+        if return_last_logit: # 只取最后一个时间步的输出
             hidden_states = hidden_states[-1:]  # 只取最后一个输出 shape = [1, batch_size, hidden_size]
-        lm_logits = self.transformer.output_layer(hidden_states) # shape = [seq_length, batch_size, vocab_size]
-        lm_logits = lm_logits.transpose(0, 1).contiguous() # shape = [batch_size, seq_length, vocab_size]
+        lm_logits = self.transformer.output_layer(hidden_states) # shape = [1, batch_size, vocab_size]
+        lm_logits = lm_logits.transpose(0, 1).contiguous() # shape = [batch_size, 1, vocab_size]
 
         loss = None
+        
+        # 如果提供了标签，则计算损失
         if labels is not None:
+            # 将 lm_logits 转换为 torch.float32 类型，因为交叉熵损失函数通常要求输入为 float32 类型
             lm_logits = lm_logits.to(torch.float32)
 
             # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            # 使得第 n 个 token 的预测目标是第 n+1 个 token
+            # shift_logits 的形状为 [batch_size, seq_len-1, vocab_size]
+                # 假设，完整的句子是 ：“今天天气很不错”
+            shift_logits = lm_logits[..., :-1, :].contiguous() # 今天天气很不 shape = [batch_size, seq_len-1, vocab_size]
+            shift_labels = labels[..., 1:].contiguous() # 天天气很不错  shape = [batch_size, seq_len-1]
             # Flatten the tokens
             loss_fct = CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
@@ -1179,6 +1198,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         if not return_dict:
             output = (lm_logits,) + transformer_outputs[1:]
+            
+            # shape =  (loss, lm_logits, transformer_outputs[1], transformer_outputs[2], ...)
             return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithPast(
@@ -1199,11 +1220,36 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         beam_idx at every generation step.
 
         Output shares the same memory storage as `past`.
+        
+        ---
+        
+        该函数用于在beam search生成过程中重新排序缓存中的键值对，
+            这样做的目的是确保在每一步生成过程中，past_key_values 能够与正确的束索引（beam index）相对应，
+            从而保证生成的候选序列与历史缓存正确对齐。
+        
+        通过index_select方法按beam_idx索引重新选择各层的key和value张量，
+            保持内存共享以提高效率。
+        ---
+        
+        Args:
+        past：这是一个嵌套元组，外层元组的每个元素代表模型的一层，内层元组包含两个 torch.Tensor，分别是该层的 key 和 value 张量。
+            通常 key 和 value 的形状为 (batch_size, num_heads, seq_length, head_dim)。
+        
+        beam_idx：这是一个 torch.LongTensor 类型的张量，包含了束搜索过程中每个束的索引，用于指示如何对 past_key_values 进行重新排序。
+        
+        Return:
+        返回值：返回一个与 past 结构相同的嵌套元组，其中的 key 和 value 张量已经按照 beam_idx 进行了重新排序。
         """
+        
+        '''
+        index_select(1, beam_idx.to(layer_past[0].device))：
+            使用 index_select 方法在第 1 个维度（通常是 batch_size 维度）上按照 beam_idx 进行索引选择。
+            beam_idx.to(layer_past[0].device) 确保 beam_idx 与 key 或 value 张量在同一设备上。
+        '''
         return tuple(
             (
-                layer_past[0].index_select(1, beam_idx.to(layer_past[0].device)),
-                layer_past[1].index_select(1, beam_idx.to(layer_past[1].device)),
+                layer_past[0].index_select(1, beam_idx.to(layer_past[0].device)), # key
+                layer_past[1].index_select(1, beam_idx.to(layer_past[1].device)), # value
             )
             for layer_past in past
         )
@@ -1213,7 +1259,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         response = response.replace("[[训练时间]]", "2023年")
         return response
 
-    def build_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None):
+    def build_inputs(self, tokenizer:AutoTokenizer, query: str, history: List[Tuple[str, str]] = None):
         prompt = tokenizer.build_prompt(query, history=history)
         inputs = tokenizer([prompt], return_tensors="pt")
         inputs = inputs.to(self.device)
@@ -1231,19 +1277,45 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         inputs = inputs.to(self.device)
         return inputs
 
-    @torch.inference_mode()
+    @torch.inference_mode() # 这是一个装饰器，用于开启推理模式，在该模式下，PyTorch 会禁用梯度计算，从而减少内存使用并提高推理速度。
     def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 8192, num_beams=1,
              do_sample=True, top_p=0.8, temperature=0.8, logits_processor=None, **kwargs):
+        '''
+        ## Args:
+            tokenizer：分词器，用于将文本转换为模型可以处理的 token。
+            query：用户输入的查询文本，类型为字符串。
+            history：对话历史记录，类型为元组列表，每个元组包含两个字符串，分别表示用户的输入和模型的回复。默认为 None。
+            max_length：生成文本的最大长度，默认为 8192。
+            num_beams：束搜索的束数，默认为 1。
+            do_sample：是否进行采样，默认为 True。
+            top_p：采样时的概率阈值，默认为 0.8。
+            temperature：采样时的温度参数，默认为 0.8。
+            logits_processor：对数概率处理器，默认为 None。
+        
+        ## 功能：
+        该方法的主要功能是与模型进行对话交互，具体步骤如下：
+
+            1. 初始化对话历史记录和对数概率处理器。
+            2. 设置生成文本所需的参数。
+            3. 根据分词器、查询文本和对话历史记录构建模型的输入。
+            4. 调用 generate 方法生成文本。
+            5. 解码生成的输出，并对回复进行处理。
+            6. 更新对话历史记录。
+            7. 返回处理后的回复和更新后的对话历史记录。
+        
+        '''
+        
+        
         if history is None:
             history = []
         if logits_processor is None:
             logits_processor = LogitsProcessorList()
-        logits_processor.append(InvalidScoreLogitsProcessor())
+        logits_processor.append(InvalidScoreLogitsProcessor()) # 用于处理无效的对数概率
         gen_kwargs = {"max_length": max_length, "num_beams": num_beams, "do_sample": do_sample, "top_p": top_p,
                       "temperature": temperature, "logits_processor": logits_processor, **kwargs}
         inputs = self.build_inputs(tokenizer, query, history=history)
         outputs = self.generate(**inputs, **gen_kwargs)
-        outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
+        outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):] # 将生成的输出转换为列表，并截取输入部分之后的内容。
         response = tokenizer.decode(outputs)
         response = self.process_response(response)
         history = history + [(query, response)]
