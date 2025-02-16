@@ -1347,11 +1347,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             attention_mask = inputs.attention_mask
             attention_mask = torch.cat((attention_mask.new_ones(1, past_length), attention_mask), dim=1)
             inputs['attention_mask'] = attention_mask
+            
         for outputs in self.stream_generate(**inputs, past_key_values=past_key_values,
                                             return_past_key_values=return_past_key_values, **gen_kwargs):
             if return_past_key_values:
                 outputs, past_key_values = outputs
-            outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]
+            outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]  # shape = (1, num_generated_tokens)
             response = tokenizer.decode(outputs)
             if response and response[-1] != "�":
                 response = self.process_response(response)
@@ -1428,7 +1429,10 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         )
         logits_warper = self._get_logits_warper(generation_config)
 
-        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
+        # 用于标记每个序列是否完成生成
+        # input_ids.new(...)：借助 input_ids 张量的 new 方法创建一个新的张量，新张量会和 input_ids 处于相同的设备（如 CPU 或 GPU）上。
+        # .fill_(1)：把新张量的所有元素初始化为 1。在这个上下文中，值为 1 表示对应序列还未完成生成，值为 0 则表示对应序列已经完成生成。
+        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1) # shape = (batch_size, )
         scores = None
         while True:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -1458,7 +1462,17 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
+            
+            # mul 是 torch.Tensor 的乘法方法，用于将 unfinished_sequences 与上述求和结果相乘
+            # next_tokens != i： 整个tensor中都没有停止符，才返回一个1， 否则返回0。 
             unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
+            
+            '''
+            假设 eos_token_id = [100]，next_tokens = [101, 100, 102]，unfinished_sequences = [1, 1, 1]。
+
+            next_tokens != 100 的结果为 [True, False, True]，转换为数值为 [1, 0, 1]。
+            unfinished_sequences.mul([1, 0, 1]) 的结果为 [1, 0, 1]，表示第二个序列已经完成生成。
+            '''
             if return_past_key_values:
                 yield input_ids, outputs.past_key_values
             else:
