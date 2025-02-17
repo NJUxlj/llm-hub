@@ -10,6 +10,10 @@ from transformers import AutoTokenizer, AutoModel
 from sse_starlette.sse import ServerSentEvent, EventSourceResponse
 
 
+from config import MODEL_PATH
+from modeling_chatglm2 import ChatGLMForConditionalGeneration
+
+
 
 
 @asynccontextmanager
@@ -82,14 +86,14 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Union[ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice]]
     created: Optional[int] = Field(default_factory=lambda: int(time.time()))
 
-
+# 这是一个HTTP GET请求的API接口，路径为 /v1/models。
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
     global model_args
     model_card = ModelCard(id="gpt-3.5-turbo")
     return ModelList(data=[model_card])
 
-
+#  这是一个HTTP POST请求的API接口，路径为 /v1/chat/completions。
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(request: ChatCompletionRequest):
     global model, tokenizer
@@ -112,6 +116,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         generate = predict(query, history, request.model)
         return EventSourceResponse(generate, media_type="text/event-stream")
 
+    model:ChatGLMForConditionalGeneration
     response, _ = model.chat(tokenizer, query, history=history)
     choice_data = ChatCompletionResponseChoice(
         index=0,
@@ -163,8 +168,9 @@ async def predict(query: str, history: List[List[str]], model_id: str):
 
 
 if __name__ == "__main__":
-    tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True)
-    model = AutoModel.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True).cuda()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    tokenizer.padding_side = "left"
+    model = ChatGLMForConditionalGeneration.from_pretrained(MODEL_PATH, trust_remote_code=True).cuda()
     # 多显卡支持，使用下面两行代替上面一行，将num_gpus改为你实际的显卡数量
     # from utils import load_model_on_gpus
     # model = load_model_on_gpus("THUDM/chatglm2-6b", num_gpus=2)
