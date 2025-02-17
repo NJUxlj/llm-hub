@@ -116,7 +116,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         generate = predict(query, history, request.model)
         return EventSourceResponse(generate, media_type="text/event-stream")
 
-    model:ChatGLMForConditionalGeneration
+    
     response, _ = model.chat(tokenizer, query, history=history)
     choice_data = ChatCompletionResponseChoice(
         index=0,
