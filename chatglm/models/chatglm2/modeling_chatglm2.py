@@ -28,7 +28,7 @@ from transformers.generation.logits_process import LogitsProcessor
 from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList, GenerationConfig, ModelOutput
 
 
-from .configuration_chatglm import ChatGLMConfig
+from configuration_chatglm import ChatGLMConfig
 
 # flags required to enable jit fusion kernels
 
@@ -1082,7 +1082,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
     ) -> Dict[str, Any]:
         # update past_key_values
         model_kwargs["past_key_values"] = self._extract_past_from_model_output(
-            outputs, standardize_cache_format=standardize_cache_format
+            outputs, # standardize_cache_format=standardize_cache_format
         )
 
         # update attention mask
@@ -1306,6 +1306,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             top_p：采样时的概率阈值，默认为 0.8。
             temperature：采样时的温度参数，默认为 0.8。
             logits_processor：对数概率处理器，默认为 None。
+            
+        ## Return
+            return response, history
         
         ## 功能：
         该方法的主要功能是与模型进行对话交互，具体步骤如下：
