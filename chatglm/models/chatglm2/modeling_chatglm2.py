@@ -1547,11 +1547,11 @@ class ChatGLMForSequenceClassification(ChatGLMPreTrainedModel):
             return_dict=return_dict,
         )
 
-        hidden_states = transformer_outputs[0]
-        pooled_hidden_states = hidden_states[-1]
+        hidden_states = transformer_outputs[0] # shape = (seq_length, batch_size, hidden_size)
+        pooled_hidden_states = hidden_states[-1] # shape = (batch_size, hidden_size)
         if self.dropout is not None:
-            pooled_hidden_states = self.dropout(pooled_hidden_states)
-        logits = self.classifier_head(pooled_hidden_states)
+            pooled_hidden_states = self.dropout(pooled_hidden_states) 
+        logits = self.classifier_head(pooled_hidden_states) # shape = (batch_size, num_labels)
 
         loss = None
         if labels is not None:
@@ -1566,7 +1566,7 @@ class ChatGLMForSequenceClassification(ChatGLMPreTrainedModel):
             if self.config.problem_type == "regression":
                 loss_fct = MSELoss()
                 if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze().float(), labels.squeeze())
+                    loss = loss_fct(logits.squeeze().float(), labels.squeeze()) # (batch_size, ) * (batch_size,)
                 else:
                     loss = loss_fct(logits.float(), labels)
             elif self.config.problem_type == "single_label_classification":
