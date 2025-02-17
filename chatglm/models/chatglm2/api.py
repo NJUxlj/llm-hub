@@ -11,6 +11,9 @@ DEVICE_ID = "0"
 CUDA_DEVICE = f"{DEVICE}:{DEVICE_ID}" if DEVICE_ID else DEVICE
 
 
+from config import MODEL_PATH
+
+
 '''
 
 这段代码是一个基于Python的异步HTTP服务端点的实现，通常用于处理前端发送的请求，并返回一个基于输入的生成式AI模型的响应。
@@ -64,8 +67,9 @@ async def create_item(request: Request)->Dict:
 
 
 if __name__ == '__main__':
-    tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True)
-    model = ChatGLMForConditionalGeneration.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True).cuda()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    tokenizer.padding_side = "left"
+    model = ChatGLMForConditionalGeneration.from_pretrained(MODEL_PATH, trust_remote_code=True).cuda()
     # 多显卡支持，使用下面三行代替上面两行，将num_gpus改为你实际的显卡数量
     # model_path = "THUDM/chatglm2-6b"
     # tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
