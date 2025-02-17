@@ -1269,14 +1269,26 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         return inputs
 
     def build_stream_inputs(self, tokenizer, query: str, history: List[Tuple[str, str]] = None):
+        '''
+        ## function:
+            其主要功能是根据用户输入的查询文本 query 和对话历史记录 history 构建模型输入
+        '''
         if history:
             prompt = "\n\n[Round {}]\n\n问：{}\n\n答：".format(len(history) + 1, query)
             input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            input_ids = input_ids[1:]
+            input_ids = input_ids[1:] # 去掉 input_ids 的第一个元素，可能是为了去除不必要的起始 token。
+            # batch_encode_plus : 将多个文本批量编码为模型可以处理的输入格式
             inputs = tokenizer.batch_encode_plus([(input_ids, None)], return_tensors="pt", add_special_tokens=False)
         else:
             prompt = "[Round {}]\n\n问：{}\n\n答：".format(len(history) + 1, query)
             inputs = tokenizer([prompt], return_tensors="pt")
+            
+        '''
+        inputs 的类型是一个字典（dict），这是 transformers 库中分词器的常见返回类型。字典中通常包含以下几个键：
+
+            input_ids：这是一个 torch.Tensor 类型的张量，包含输入文本的 token ID。
+            attention_mask：这也是一个 torch.Tensor 类型的张量，用于指示哪些位置是有效的输入，哪些位置是填充的。
+        '''
         inputs = inputs.to(self.device)
         return inputs
 
@@ -1333,6 +1345,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         if logits_processor is None:
             logits_processor = LogitsProcessorList()
         logits_processor.append(InvalidScoreLogitsProcessor())
+        
         gen_kwargs = {"max_length": max_length, "do_sample": do_sample, "top_p": top_p,
                       "temperature": temperature, "logits_processor": logits_processor, **kwargs}
         if past_key_values is None and not return_past_key_values:
@@ -1340,10 +1353,10 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         else:
             inputs = self.build_stream_inputs(tokenizer, query, history=history)
         if past_key_values is not None:
-            past_length = past_key_values[0][0].shape[0]
+            past_length = past_key_values[0][0].shape[0] # 这里取第一个键张量的第一个维度（即序列长度）。
             if self.transformer.pre_seq_len is not None:
-                past_length -= self.transformer.pre_seq_len
-            inputs.position_ids += past_length
+                past_length -= self.transformer.pre_seq_len # pre_seq_len 可能表示前缀序列的长度，这里是为了排除前缀序列的影响。
+            inputs.position_ids += past_length # 在原有的 位置id矩阵的基础上， 加上历史上生成的文本的长度， 表示当前生成的文本的起始位置是从历史上生成的文本的末尾开始的。
             attention_mask = inputs.attention_mask
             attention_mask = torch.cat((attention_mask.new_ones(1, past_length), attention_mask), dim=1)
             inputs['attention_mask'] = attention_mask
@@ -1354,6 +1367,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 outputs, past_key_values = outputs
             outputs = outputs.tolist()[0][len(inputs["input_ids"][0]):]  # shape = (1, num_generated_tokens)
             response = tokenizer.decode(outputs)
+            
             if response and response[-1] != "�":
                 response = self.process_response(response)
                 new_history = history + [(query, response)]
@@ -1377,6 +1391,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
 
         if generation_config is None:
             generation_config = self.generation_config
+            
         generation_config = copy.deepcopy(generation_config)
         model_kwargs = generation_config.update(**kwargs)
         model_kwargs["use_cache"] = generation_config.use_cache
@@ -1392,7 +1407,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
                 "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
                 " recommend using `max_new_tokens` to control the maximum length of the generation.",
                 UserWarning,
-            ) # 这里的作用是将generation_config.max_length设置为generation_config.max_new_tokens + input_ids_seq_length
+            ) # 这里的作用是将 generation_config.max_length设置为generation_config.max_new_tokens + input_ids_seq_length
         elif generation_config.max_new_tokens is not None:
             generation_config.max_length = generation_config.max_new_tokens + input_ids_seq_length
             if not has_default_max_length:
@@ -1437,7 +1452,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         while True:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
-            outputs = self(
+            outputs = self.forward(
                 **model_inputs,
                 return_dict=True,
                 output_attentions=False,
@@ -1453,12 +1468,12 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             # sample
             probs = nn.functional.softmax(next_token_scores, dim=-1)
             if generation_config.do_sample:
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1) # 多项式采样， 随机选择一个 token
             else:
                 next_tokens = torch.argmax(probs, dim=-1)
 
             # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)  # shape = (batch_size, seq_length + 1)
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
