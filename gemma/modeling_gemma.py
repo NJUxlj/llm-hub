@@ -129,6 +129,15 @@ class GemmaRotaryEmbedding(nn.Module):
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     
+    '''
+    功能：
+        该函数将输入张量 x 的最后一个维度的元素进行旋转操作，即将最后一个维度的后半部分元素取负后，与前半部分元素拼接在一起。
+    代码详解：
+        x1 = x[..., :x.shape[-1]//2]：从输入张量 x 中取出最后一个维度的前半部分元素。
+        x2 = x[...,x.shape[-1]//2:]：从输入张量 x 中取出最后一个维度的后半部分元素。
+        return torch.cat([-x2,x1], dim=-1)：将后半部分元素取负后，与前半部分元素在最后一个维度上进行拼接。
+    '''
+    
     x1 = x[..., :x.shape[-1]//2]
     x2 = x[...,x.shape[-1]//2:]
     
@@ -136,7 +145,42 @@ def rotate_half(x):
 
 
 
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
 
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+
+
+    Function:
+        功能：
+            该函数将旋转位置编码应用到查询（query）和键（key）张量上，通过使用余弦（cos）和正弦（sin）部分的旋转嵌入，对查询和键进行旋转操作。
+        代码详解：
+            cos = cos.unsqueeze(unsqueeze_dim) 和 sin = sin.unsqueeze(unsqueeze_dim)：在指定的维度上对余弦和正弦张量进行维度扩展，以便能够与查询和键张量进行广播操作。
+            q_embed = (q * cos) + (rotate_half(q) * sin)：对查询张量 q 应用旋转位置编码，通过将查询张量与余弦张量相乘，再加上旋转后的查询张量与正弦张量的乘积。
+            k_embed = (k * cos) + (rotate_half(k) * sin)：对键张量 k 应用旋转位置编码，同样通过将键张量与余弦张量相乘，再加上旋转后的键张量与正弦张量的乘积。
+            return q_embed, k_embed：返回经过旋转位置编码后的查询和键张量。
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralMLP with Mistral->Gemma
@@ -153,3 +197,39 @@ class GemmaMLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    
+    
+    
+    
+    
+
+
+
+
+
+# Copied from transformers.models.llama.modeling_llama.repeat_kv
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    
+    
+    
+
+
+
+class GemmaAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    # Ignore copy
+    def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
+                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )

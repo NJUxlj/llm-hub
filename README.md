@@ -26,8 +26,18 @@
 
 ## Updates
 1. `ChatGLM2` is already finished with comprehensive explaination and comment added to the files.
+2. now we are working on Qwen and Llama.
 
 
+## Future Works
+- if we have time, a tutorial of Beam Search can be updated. 
+
+
+
+## Environment Config
+- AutoDL Cloud Platform
+![env](image/env.png)
+- then, make sure to pre-download the model weight (e.g. ChatGLM2-6B on the huggingface) to the local storage (e.g., `/root/autodl-tmp/models/chatglm2`).
 
 
 ## Run
