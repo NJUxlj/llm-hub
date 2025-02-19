@@ -20,6 +20,24 @@
 - qwen2
 
 
+## Important Notes
+- `ChatGLM2` only supports transformers version `== 4.41.2`, please downgrade using `pip install transformers==4.41.2`
+
+
+## Updates
+1. `ChatGLM2` is already finished with comprehensive explaination and comment added to the files.
+
+
+
+
+## Run
+```
+cd chatglm/models/chatglm2
+
+python main.py
+
+```
+
 
 
 ## comparsion between different open-source models
