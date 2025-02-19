@@ -212,7 +212,17 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    
+    ## function:
+        功能：
+            该函数用于将输入张量 hidden_states 在第二个维度上进行重复操作，将每个元素重复 n_rep 次。
+            
+            num_key_value_heads 是指键值对的数量，而 num_attention_heads 是指注意力头的数量。
+            
+            一般来说 num_key_value_heads <= num_attention_heads，因此，本函数的任务，就是将键值对的数量增加到与注意力头的数量相等(通过拷贝的方式)。
     """
+    
+    batch, num_key_value_heads, slen, head_dim = hidden_states.size()
     
     
     
