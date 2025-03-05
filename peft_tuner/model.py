@@ -6,7 +6,11 @@ from torch.optim import Adam, SGD
 
 # from qwen2.models.modeling_qwen2 import Qwen2ForSequenceClassification
 
-TorchModel = AutoModelForSequenceClassification.from_pretrained(Config["pretrain_model_path"])
+TorchModel = AutoModelForSequenceClassification.from_pretrained(
+    Config["pretrain_model_path"],
+    num_labels = 18
+    
+    )
 
 
 
