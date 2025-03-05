@@ -250,9 +250,48 @@ class Attention(nn.Module):
 
         """
         super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        # 总共的GPU数量
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        # 每个GPU上的头数量
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        # 在 multi-query attention中， query的头数 = n_heads, kv的头数 <= n_heads
+        # 因此，在做注意力计算的时候，我们需要将 kv的头数复制 n_rep 份，kv.n_heads = q.n_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
+        
+        # 这是一个并行线性层，用于在模型并行设置中处理线性变换。
+        # 它将输入张量按列分割到不同的设备上，以提高计算效率。
+        self.wq = ColumnParallelLinear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False, # 表示不收集并行计算的结果。在模型并行设置中，输出会分布在不同的设备上，如果设置为False，则保持这种分布状态。
+            init_method=lambda x: x, # 这是一个初始化方法，使用恒等函数（identity function）作为初始化器。
+                                        # 这意味着权重矩阵会保持初始值不变，通常在实际使用中会使用其他初始化方法。
+        )
+        
+        self.wk = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias = False,
+            gather_output = False,
+            init_method=lambda x: x,
+        )
+        
+        self.wv = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias = False,
+            gather_output = False,
+            init_method=lambda x: x,
+        )
         
         
-    
+        self.wo = RowParallelLinear(
+            
+        )
     
     
     def forward(
@@ -260,7 +299,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor], # padding 掩码
     ):
         """
         Forward pass of the attention module.
@@ -275,7 +314,8 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         
         
         # repeat k/v heads if n_kv_heads < n_heads
