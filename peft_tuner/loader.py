@@ -40,7 +40,7 @@ class DataGenerator:
                 line = json.loads(line.strip())
                 tag = line["tag"]
                 title = line["title"]
-                
+                label = self.label_to_index[tag]
                 if self.config["model_type"] == "bert":
                     input_id = self.tokenizer.encode(
                             text = title,

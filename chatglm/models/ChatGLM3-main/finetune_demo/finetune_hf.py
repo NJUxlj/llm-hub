@@ -12,7 +12,7 @@ import torch
 import typer
 from datasets import Dataset, DatasetDict, NamedSplit, Split, load_dataset
 from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
-from peft import (
+from peft_tuner import (
     PeftConfig,
     PeftModelForCausalLM,
     get_peft_config,

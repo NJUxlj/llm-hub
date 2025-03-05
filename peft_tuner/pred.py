@@ -1,7 +1,7 @@
 import torch
 import logging
 from model import TorchModel
-from peft import (
+from peft_tuner import (
     get_peft_model, 
     LoraConfig, 
     PromptTuningConfig, 

@@ -23,7 +23,7 @@ from threading import Thread
 
 from typing import Union, Annotated
 from pathlib import Path
-from peft import AutoPeftModelForCausalLM, PeftModelForCausalLM
+from peft_tuner import AutoPeftModelForCausalLM, PeftModelForCausalLM
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import torch
-from loader import load_data
+from .loader import load_data
 
 from transformers import BertForSequenceClassification
 

@@ -6,9 +6,9 @@
 
 Config = {
     "model_path": "output",
-    "train_data_path": "data/train_tag_news.json",
-    "valid_data_path": "data/valid_tag_news.json",
-    "vocab_path":"chars.txt",
+    "train_data_path": "./peft_tuner/data/train_tag_news.json",
+    "valid_data_path": "./peft_tuner/data/valid_tag_news.json",
+    "vocab_path":"./peft_tuner/chars.txt",
     "model_type":"bert",
     "max_length": 20,
     "hidden_size": 128,

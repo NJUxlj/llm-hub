@@ -4,7 +4,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Auto
 from torch.optim import Adam, SGD
 
 
-from qwen2.models.modeling_qwen2 import Qwen2ForSequenceClassification
+# from qwen2.models.modeling_qwen2 import Qwen2ForSequenceClassification
 
 TorchModel = AutoModelForSequenceClassification.from_pretrained(Config["pretrain_model_path"])
 

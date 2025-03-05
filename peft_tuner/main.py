@@ -10,7 +10,7 @@ import logging
 from .config import Config
 from .model import TorchModel, choose_optimizer
 from .evaluate import Evaluator
-from loader import load_data
+from .loader import load_data
 
 from peft import (
     get_peft_model, 

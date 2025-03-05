@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Annotated, Union
 
 import typer
-from peft import AutoPeftModelForCausalLM, PeftModelForCausalLM
+from peft_tuner import AutoPeftModelForCausalLM, PeftModelForCausalLM
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
