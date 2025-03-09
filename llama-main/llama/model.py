@@ -107,8 +107,8 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     
     外积运算：
         将位置索引t（时间步）与基础频率相乘
-        生成二维矩阵：freqs[t,i] = t * (theta^(-2i/dim))
-    
+        生成二维矩阵：freqs[t,i] = t * (theta^(-2i/dim)) # 相当于让每个 token 对应一个频率向量
+     
     复数转换：
         通过torch.polar实现欧拉公式：e^(iθ) = cosθ + i sinθ
         每个元素对应复数：(cos(t*theta^(-2i/dim)), sin(t*theta^(-2i/dim)))
@@ -118,12 +118,46 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)) # shape = [dim // 2]
     # 序列位置索引
     t = torch.arange(end, device=freqs.device)  # type: ignore
-    # # 计算外积，得到一个二维张量，形状为 (end, dim // 2)
+    # # 计算外积，得到一个二维张量，形状为 (end, dim // 2)， 相当于让每个 token 对应一个频率向量
     freqs = torch.outer(t, freqs).float()  # type: ignore
     # 使用 torch.polar 函数将幅值为 1 的实部和 freqs 作为相位，生成复数指数张量 （欧拉公式实现） 
     # 这里的复数张量数据类型为 complex64
-    # math \text{out} = a*e^{j \theta} = abs*(cosθ + jsinθ) = \text{abs} \cdot \cos(\text{angle}) + \text{abs} \cdot \sin(\text{angle}) \cdot j
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64  # shape
+    
+    '''
+    1. torch.ones_like(freqs):
+
+        创建一个与freqs张量形状相同的全1张量
+        这些1将作为复数的模（magnitude）
+        
+    2. freqs:
+
+        这是之前计算得到的频率张量
+        这些值将作为复数的相位（phase）
+        
+        
+    3. torch.polar():
+
+        这是PyTorch的极坐标转换函数
+        根据给定的模和相位生成复数
+        数学公式：torch.polar(abs, angle) = abs * (cos(angle) + i * sin(angle))
+        这里相当于执行欧拉公式：e^(iθ) = cosθ + i sinθ
+    
+    4. 结果:
+
+        生成一个复数张量，数据类型为complex64
+        每个元素的形式为：abs(cos(freqs) + i * sin(freqs)), abs是模长， 在本例中，模长为1
+        这个复数张量将用于后续的旋转嵌入（Rotary Embedding）计算
+
+    5. 为什么需要这样做:
+
+        在Transformer中，使用复数表示可以方便地实现旋转操作
+        通过复数乘法，可以高效地实现位置信息的编码
+        这种表示方法有助于模型更好地捕捉序列中的位置关系
+        举例说明： 假设freqs中的一个元素是0.5，那么生成的复数将是： cos(0.5) + i * sin(0.5) ≈ 0.8776 + 0.4794i
+
+    这种复数表示将在后续的apply_rotary_emb函数中用于对query和key进行旋转操作，从而为模型提供位置信息。
+    '''
     return freqs_cis
 
 
@@ -139,7 +173,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 
     Args:
         freqs_cis (torch.Tensor): Frequency tensor to be reshaped. shape = [seq_len, dim//2]
-        x (torch.Tensor): Target tensor for broadcasting compatibility. x.shape = [batch_size, seq_len, dim]
+        x (torch.Tensor): Target tensor for broadcasting compatibility. x.shape = [batch_size, seq_len, dim] or [batch_size, seq_len, n_heads, head_dim//2, 2]
 
     Returns:
         torch.Tensor: Reshaped frequency tensor.
@@ -165,7 +199,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: torch.Tensor, # 预先定义好的三角频率矩阵，矩阵中的每个元素是 abs(cos(theta)+i*sin(theta))，其中， theta = 1/(10000 ^ (2i / dim)),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     
     """
@@ -175,6 +209,8 @@ def apply_rotary_emb(
     frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
     is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
     returned as real tensors.
+    
+    
 
     Args:
         xq (torch.Tensor): Query tensor to apply rotary embeddings. shape= [batch_size, seq_len, n_heads, head_dim]
@@ -192,9 +228,10 @@ def apply_rotary_emb(
         # 每对相邻的实数 $(x, y)$ 被视为一个复数 $z = x + yi$
         # 这种表示便于后续进行复数乘法（旋转操作）
     # - `view_as_complex`将这些数对解释为复数
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)) # shape = [batch_size, seq_len, n_heads, head_dim//2, 2]
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_) # [1, seq_len, 1, head_dim//2]
+    # freqs_cis.shape = [seq_len, dim//2]
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_) # [1, seq_len, 1, head_dim//2, 1] 
     
     # 应用旋转
     # xq_.shape = [batch_size, seq_len, n_heads, head_dim//2, 2]
@@ -290,8 +327,35 @@ class Attention(nn.Module):
         
         
         self.wo = RowParallelLinear(
-            
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            input_is_parallel = True,
+            init_method = lambda x:x,
         )
+        
+        # cache_k, cache_v 相当于是模型之前推理文本保存的历史记录, 每forward推理一次，就把当前的input_embedding 保存到cache里
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+            ).cuda()
+        
+        
+        self.cache_v = torch.zeros(
+            (
+             args.max_batch_size,
+             args.max_seq_len,
+             self.n_local_kv_heads,
+             self.head_dim,
+                
+            )
+            ).cuda()
+        
+        
     
     
     def forward(
@@ -317,5 +381,94 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        
+        xq, xk = self.apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+        
+        self.cache_k[:bsz, start_pos: start_pos + seqlen]  = xk
+        self.cache_v[:bsz, start_pos: start_pos + seqlen]  = xv
+        
+        keys = self.cache_k[:bsz, :start_pos + seqlen]
+        values = self.cache_v[:bsz, :start_pos + seqlen]
         
         # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(keys, n_rep=self.n_rep) # (bs, seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, n_rep=self.n_rep) # (bs, seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2) # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+        
+        scores = torch.matmul(xq, keys.transpose(2,3)) / math.sqrt(self.head_dim)
+        
+        if mask is not None:
+            scores += mask # (bs, n_local_heads, seqlen, cache_len + seqlen) # where q_size = seqlen and k_size = cache_len + seqlen
+        
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output) # shape = [batch_size, seq_len, dim]
+        
+        
+    def apply_rotary_emb(
+        self,
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply rotary embeddings to input tensors using the given frequency tensor.
+
+        This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
+        frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
+        is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
+        returned as real tensors.
+
+        Args:
+            xq (torch.Tensor): Query tensor to apply rotary embeddings. shape= [batch_size, seq_len, n_heads, head_dim]
+            xk (torch.Tensor): Key tensor to apply rotary embeddings. shape= [batch_size, seq_len, n_heads, head_dim]
+            freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials. shape = [seq_len, dim//2]
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+
+            return xq, xk, where xq.shape == xk.shape [batch_size, seq_len, n_heads, head_dim]
+
+        """
+        
+
+
+
+
+
+
+
+
+class Feedforward(nn.Module):
+    def __init__(
+       self,
+       dim: int,
+       hidden_dim:int,
+        
+    ):
+        """
+        Initialize the FeedForward module.
+
+        Args:
+            dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension of the feedforward layer.
+            multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
+            ffn_dim_multiplier (float, optional): Custom multiplier for hidden dimension. Defaults to None.
+
+        Attributes:
+            w1 (ColumnParallelLinear): Linear transformation for the first layer.
+            w2 (RowParallelLinear): Linear transformation for the second layer.
+            w3 (ColumnParallelLinear): Linear transformation for the third layer.
+
+        """
