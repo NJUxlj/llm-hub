@@ -15,7 +15,7 @@ from fairscale.fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
-
+from typing import List, Optional, Tuple, Dict
 
 @dataclass
 class ModelArgs:
@@ -95,10 +95,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
         dim（整数）：频率张量的维度大小。可以把它想象成一个多维数组的某一个维度的长度。
         end（整数）：预先计算频率的结束索引。这个索引决定了我们要计算多少个频率值。
         theta（浮点数，可选）：频率计算的缩放因子，默认值是 10000.0。这个因子会影响频率的计算结果，就像一个调整频率大小的“旋钮”。
-    返回值
-        返回一个预先计算好的包含复指数的频率张量，数据类型为 torch.Tensor。这个张量可以在后续的计算中使用，比如在一些深度学习模型里用于旋转嵌入（rotary embeddings）的计算。
-
-        return freqs_cis: shape = [seq_len, dim // 2]
+    
         
     基础频率计算：
         theta=10000.0控制频率衰减速度
@@ -112,6 +109,16 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     复数转换：
         通过torch.polar实现欧拉公式：e^(iθ) = cosθ + i sinθ
         每个元素对应复数：(cos(t*theta^(-2i/dim)), sin(t*theta^(-2i/dim)))
+        
+        
+    ##Return
+        返回一个预先计算好的包含复指数的频率张量。
+
+        生成一个复数张量，数据类型为complex64
+        每个元素的形式为：abs(cos(freqs) + i * sin(freqs)) = abs* e^{i*freqs}, abs是模长， 在本例中，模长为1
+        这个复数张量将用于后续的旋转嵌入（Rotary Embedding）计算
+        
+        return freqs_cis: shape = [seq_len, dim // 2]
     '''
     
     # 这里使用了 torch.arange 生成从 0 到 dim 步长为 2 的张量，然后取前 dim // 2 个元素
@@ -442,6 +449,26 @@ class Attention(nn.Module):
 
         """
         
+        
+        # 首先将query和key张量重塑并转换为复数形式。这里通过`reshape(*xq.shape[:-1], -1, 2)`将最后一个维度每两个数字组合成一个复数，其中:
+        # - 实部和虚部分别对应embedding维度中相邻的两个值
+            # 每对相邻的实数 $(x, y)$ 被视为一个复数 $z = x + yi$
+            # 这种表示便于后续进行复数乘法（旋转操作）
+        # - `view_as_complex`将这些数对解释为复数
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)) 
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+        freqs_cis = reshape_for_broadcast(freqs_cis, xq_) # [1, seq_len, 1, head_dim//2, 1]
+        
+        # 应用旋转
+        # xq_.shape = [batch_size, seq_len, n_heads, head_dim//2, 2]
+        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)   # 对位相乘， 然后将复数转回实数对， 然后 flatten(3) 将最后两个维度合并
+        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+        
+        # - 通过复数乘法实现旋转变换
+        # - `view_as_real`将结果转回实数域
+        # - `flatten(3)`将最后两个维度压缩回原始形状 
+
+        return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 
@@ -449,13 +476,13 @@ class Attention(nn.Module):
 
 
 
-
-class Feedforward(nn.Module):
+class FeedForward(nn.Module):
     def __init__(
        self,
        dim: int,
        hidden_dim:int,
-        
+       multiple_of:int,
+       ffn_dim_multiplier:Optional[float]
     ):
         """
         Initialize the FeedForward module.
@@ -472,3 +499,205 @@ class Feedforward(nn.Module):
             w3 (ColumnParallelLinear): Linear transformation for the third layer.
 
         """
+        
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+            
+        hidden_dim  = multiple_of * ((hidden_dim + multiple_of -1) // multiple_of)
+            
+            
+        # 模型并行：将权重矩阵按列拆分到不同设备，每个设备计算部分结果
+        self.w1 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        )
+        
+        
+        # 权重矩阵形状为 [hidden_dim, dim]
+        # 按行拆分到不同设备，例如设备1持有 W2[0:hidden_dim//n, :]，设备2持有 W2[hidden_dim//n:, :]
+        
+         # - 输入x已经提前被多头分块好了 ：[bsz, n, b, dim/n]
+        # 设备1计算：x[..., :dim/n] @ W2[:dim/n, hidden_dim].T → output_part1
+        # 设备2计算：x[..., dim/n:] @ W2[dim/n:, hidden_dim].T → output_part2
+        # 设备 n....
+        # 最终输出 = output_part1 + output_part2 + output_partn
+        
+        # 这里涉及到分块矩阵乘法，可以在草稿纸上尝试：A1*B1 + A2*B2 = A*B [其中，A1,A2是x按列分块, B1, B2 是 W 按行分块]
+        self.w2 = RowParallelLinear(
+            hidden_dim, dim, bias=False, input_parallel=True, init_method=lambda x: x
+        )
+        
+        self.w3 = ColumnParallelLinear( # gather_output=False: 每个设备上单独做运算，不需要聚集所有GPU的结果
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            
+        )
+        
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    
+    
+    
+    
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id:int, args:ModelArgs):
+        """
+        Initialize a TransformerBlock.
+
+        Args:
+            layer_id (int): Identifier for the layer.
+            args (ModelArgs): Model configuration parameters.
+
+        Attributes:
+            n_heads (int): Number of attention heads.
+            dim (int): Dimension size of the model.
+            head_dim (int): Dimension size of each attention head.
+            attention (Attention): Attention module.
+            feed_forward (FeedForward): FeedForward module.
+            layer_id (int): Identifier for the layer.
+            attention_norm (RMSNorm): Layer normalization for attention output.
+            ffn_norm (RMSNorm): Layer normalization for feedforward output.
+
+        """
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        
+        self.attention= Attention(args)
+        
+        self.feed_forward = FeedForward(
+            dim = args.dim,
+            hidden_dim = 4*args.dim,
+            multiple_of = args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+        )
+        
+        self.layer_id = layer_id
+        
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor]
+        ):
+        """
+        Perform a forward pass through the TransformerBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position for attention caching.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+            mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feedforward layers.
+
+        """
+        # 比起 post-norm, pre-norm 的训练效果更稳定，但是效果略差
+        h = x + self.attention.forward(
+            self.attention_norm(x), start_pos, freqs_cis, mask
+        )
+
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        
+        return out
+
+
+
+class Transformer(nn.Module):
+    
+    
+    def __init__(self, params:ModelArgs):
+        """
+        Initialize a Transformer model.
+
+        Args:
+            params (ModelArgs): Model configuration parameters.
+
+        Attributes:
+            params (ModelArgs): Model configuration parameters.
+            vocab_size (int): Vocabulary size.
+            n_layers (int): Number of layers in the model.
+            tok_embeddings (ParallelEmbedding): Token embeddings.
+            layers (torch.nn.ModuleList): List of Transformer blocks.
+            norm (RMSNorm): Layer normalization for the model output.
+            output (ColumnParallelLinear): Linear layer for final output.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+        """
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+        
+        
+        
+        self.tok_embeddings = ParallelEmbedding(
+            params.vocab_size, params.dim, init_method = lambda x:x
+        )
+        
+        
+        self.layers:List[TransformerBlock] = nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+        
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = ColumnParallelLinear(   # LM head
+            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        )
+        
+        
+        self.freqs_cis = precompute_freqs_cis(
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
+            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+        )
+        
+        
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int):
+        """
+        Perform a forward pass through the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input token indices.
+            start_pos (int): Starting position for attention caching.
+
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model.
+
+        """
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        
+        mask = None
+        if seqlen > 1:
+            mask = torch.full(
+                (1, 1, seqlen, seqlen), float("-inf"), device = tokens.device
+            )
+            # 创建上三角矩阵，从主对角线偏移 (start_pos+1) 的位置开始
+            # diagonal=start_pos+1实现动态偏移：
+                # 初始生成时（start_pos=0）：对角线偏移1，形成严格上三角
+                # 增量生成时（start_pos>0）：保留历史注意力的同时屏蔽未来token
+            mask = torch.triu(mask, diagonal =  start_pos +1 ).type_as(h) 
+            # start_pos 及其之前，全是历史记录， 是Transformer模型中，最初始的cache
+            # 换个角度理解， 对角线上移其实是把 attention mask 左侧的前 start_pos 列全部宅出来， 作为历史记录 ，剩余的 seqlen-start_pos 列，可以看做一个常规的attention矩阵。
+        for layer in self.layers:
+            h = layer.forward(h, start_pos, freqs_cis = self.freqs_cis, mask = mask)
+        h = self.norm(h)
+        
+        output = self.output(h).float()
+        return output
