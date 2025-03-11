@@ -153,7 +153,7 @@ class Llama:
         top_p: float = 0.9,
         logprobs: bool = False,
         echo: bool = False,
-    ):
+    )-> Tuple[List[List[int]], Optional[List[List[float]]]]:
         """
         Generate text sequences based on provided prompts using the language generation model.
 
@@ -179,8 +179,104 @@ class Llama:
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
         min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens) # 找到一个批次中最长的前缀的长度
         assert max_prompt_len <= params.max_seq_len
+        
+        
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+        
+        pad_id = self.tokenizer.pad_id
+        tokens = torch.full((bsz, total_len), fill_value = pad_id, dtype = torch.long, device = "cuda")
+        # tokens.shape = (bsz, prompt_len + seq_len)
+        
+        for k, t in enumerate(prompt_tokens): # 将prmopt token 复制到 tokens中
+            tokens[k, :len(t)] = torch.tensor(t, dtype = torch.long, device="cuda" )
+        
+        if logprobs:
+            token_logprobs = torch.zero_like(tokens, dtype=torch.float)
+        
+        
+        prev_pos = 0 # 前缀长度，也就是真正的输入开始的位置
+        eos_reached = torch.tensor([False]*bsz, device = "cuda") # shape = (bsz, )
+        input_text_mask = tokens != pad_id
+        
+        
+        if min_prompt_len == total_len:
+            logits = self.model.forward(tokens, prev_pos) # shape = (bsz, prompt_len + seq_len, vocab_size)
+            token_logprobs = -F.cross_entropy(
+                input = logits.transpose(1,2),  # shape = (bsz, vocab_size, prompt_len + seq_len)
+                target = tokens ,  # shape = (bsz, prompt_len + seq_len)
+                reduction = "none",
+                ignore_index = pad_id,
+            ) # shape = (bsz, prompt_len + seq_len)
+        
+        
+        
+        for cur_pos in range(min_prompt_len, total_len):
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            if temperature > 0:
+                # logits[:, -1]: 取每个sequence的最后一个token, shape = (bsz, vocab_size)
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1) # 对每个token的prob都做scalling
+                next_token = sample_top_p(probs, top_p) # shape = (batch_size, )
+            else:
+                next_token = torch.argmax(logits[:,-1], dim=-1)
+            
+            next_token = next_token.reshape(-1)
+        
+            next_token= torch.where(
+                input_text_mask[:, cur_pos], tokens[:,cur_pos], next_token
+            )
+            
+            tokens[:,cur_pos] = next_token
+            
+            
+            if logprobs:
+                token_logprobs[:, prev_pos + 1, cur_pos + 1] = -F.cross_entropy(
+                    # logits.shape = (bsz, cur_pos - prev_pos, vocab_size)
+                    input = logits.transpose(1,2),   # (bsz, vocab_size, cur_pos - prev_pos)
+                    target = tokens[:, prev_pos+1 : cur_pos+1],
+                    reduction = "none",
+                    ignore_index = pad_id,
+                )  # shape = (bsz, max_prompt_len + max_gen_len)
+        
+            eos_reached # (batch_size, ) 
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (
+                next_token == self.tokenizer.eos_id
+            )
+            prev_pos = cur_pos # 更新前缀长度
+            
+            if all(eos_reached): # 如果所有的sequence都已经生成完毕，就跳出循环
+                break
+            
+        # token_logprobs.shape = (bsz, prompt_len + seq_len)
+        if logprobs:
+            token_logprobs = token_logprobs.tolist()
+        
+        # batch级别的总包列表 List[List[int]], List[List[float]]
+        out_tokens, out_logprobs = [], []
+        for i, toks in enumerate(tokens.tolist()): # toks.typed = List[int]
+            # cut to max gen len
+            start =0 if echo else len(prompt_tokens[i])
+            toks = toks[start: len(prompt_tokens[i]) + max_gen_len]
+            probs = None
+            
+            if logprobs:
+                probs = token_logprobs[i][start: len(prompt_tokens[i])+max_gen_len]
+            
+            # cut to eos tok if any
+            if self.tokenizer.eos_id in toks:
+                eos_idx = toks.index(self.tokenizer.eos_id)
+                toks = toks[:eos_idx]
+                probs = probs[:eos_idx] if probs is not None else None
+            
+            out_tokens.append(toks)
+            out_logprobs.append(probs)
+            
+        return (out_tokens, out_logprobs if logprobs else None)
+            
+            
+            
+            
         
         
     
@@ -379,35 +475,6 @@ class Llama:
             ]
         
         
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
