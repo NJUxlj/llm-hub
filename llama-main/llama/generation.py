@@ -44,7 +44,11 @@ class ChatPrediction(TypedDict, total=False):
 Dialog = List[Message]
 
 
+B_INST, E_INST = "[INST]", "[/INST]"
+B_SYS, E_SYS = "<<SYS>>\n", "\n<</SYS>>\n\n"
 
+SPECIAL_TAGS = [B_INST, E_INST, "<<SYS>>", "<</SYS>>"]
+UNSAFE_ERROR = "Error: special tags are not allowed as part of the prompt."
 
 
 
@@ -83,17 +87,102 @@ class Llama:
 
         """
     
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group("nccl")
+        if not model_parallel_is_initialized():
+            if model_parallel_size is None:
+                model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
+            initialize_model_parallel(model_parallel_size)
+
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
+        # seed must be the same in all processes
+        torch.manual_seed(seed)
+
+        if local_rank > 0:
+            sys.stdout = open(os.devnull, "w") # 将标准输出重定向到 devnull, devnull是一个特殊的设备文件，写入其中的数据会被丢弃
+            # 对于所有非主进程（local_rank > 0），它们的标准输出将被静默，只有主进程（local_rank = 0）会保留正常的输出功能
+
+        start_time = time.time()
+        checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}" # 确保至少找到一个检查点文件
+        assert model_parallel_size == len(
+            checkpoints
+        ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
+        ckpt_path = checkpoints[get_model_parallel_rank()] # 根据当前进程的并行rank选择对应的检查点文件
+        checkpoint = torch.load(ckpt_path, map_location="cpu") # 加载检查点文件到CPU
+        with open(Path(ckpt_dir) / "params.json", "r") as f:
+            params = json.loads(f.read())
+
+        model_args: ModelArgs = ModelArgs(
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            **params,
+        )
+        tokenizer = Tokenizer(model_path=tokenizer_path)
+        model_args.vocab_size = tokenizer.n_words
+        torch.set_default_tensor_type(torch.cuda.HalfTensor) # float16
+        model = Transformer(model_args)
+        '''
+        strict=False 参数的含义：
+
+            允许模型加载不完整的权重（比如checkpoint中缺少某些层的权重）
+            但并不意味着只加载部分层
+            如果checkpoint中缺少某些层的权重，这些层会保持初始化状态
+        '''
+        model.load_state_dict(checkpoint, strict=False)
+        print(f"Loaded in {time.time() - start_time:.2f} seconds")
+
+        return Llama(model, tokenizer)
+        
+        
     
     
     
-    def __init__(self):
-        pass
+    def __init__(self, model:Transformer, tokenizer:Tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
     
     @torch.inference_mode
     def generate(
         self,
+        prompt_tokens: List[List[int]],
+        max_gen_len: int,
+        temperature: float = 0.6,
+        top_p: float = 0.9,
+        logprobs: bool = False,
+        echo: bool = False,
     ):
-        pass
+        """
+        Generate text sequences based on provided prompts using the language generation model.
+
+        Args:
+            prompt_tokens (List[List[int]]): List of tokenized prompts, where each prompt is represented as a list of integers.
+            max_gen_len (int): Maximum length of the generated text sequence.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences and, if logprobs is True, corresponding token log probabilities.
+
+        Note:
+            This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
+        
+        params = self.model.params
+        bsz = len(prompt_tokens)
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert max_prompt_len <= params.max_seq_len
+        
+        
     
     
     
@@ -106,8 +195,57 @@ class Llama:
         logprobs: bool = False,
         echo: bool = False,
     ) -> List[CompletionPrediction]:
-        pass
+        """
+        Perform text completion for a list of prompts using the language generation model.
+
+        Args:
+            prompts (List[str]): List of text prompts for completion.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            max_gen_len (Optional[int], optional): Maximum length of the generated completion sequence.
+                If not provided, it's set to the model's maximum sequence length minus 1.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            List[CompletionPrediction]: List of completion predictions, each containing the generated text completion.
+
+        Note:
+            This method generates text completions for the provided prompts, employing nucleus sampling to introduce controlled randomness.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
     
+    
+    
+        if max_gen_len is None:
+                max_gen_len = self.model.params.max_seq_len - 1
+
+        
+        prompt_tokens:List[List[int]] = [self.tokenizer.encode(x) for x in prompts]
+        
+        
+        generation_tokens, generation_logprobs= self.generate(
+            prompt_tokens=prompt_tokens,
+            max_gen_len=max_gen_len,
+            temperature=temperature,
+            top_p=top_p,
+            logprobs=logprobs,
+            echo=echo,
+        )
+        
+        if logprobs:
+            return [
+                {
+                    "generation": self.tokenizer.decode(t),
+                    "tokens": [self.tokenizer.decode(x) for x in t],
+                    "logprobs": logprobs_i, # logprobs_i 是一个列表，包含了每个生成的 token 的 logprob
+                    
+                }
+                for t, logprobs_i in zip(generation_tokens, generation_logprobs)
+            ]
+        else:
+            return [{"generation":self.tokenizer.decode(t)} for t in generation_tokens]
     
     
     def chat_completion(
@@ -118,11 +256,129 @@ class Llama:
         max_gen_len: Optional[int] = None,
         logprobs: bool = False,
     ) -> List[ChatPrediction]:
-        pass
-    
-    
-    
+        """
+        Generate assistant responses for a list of conversational dialogs using the language generation model.
 
+        Args:
+            dialogs (List[Dialog]): List of conversational dialogs, where each dialog is a list of messages.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            max_gen_len (Optional[int], optional): Maximum length of the generated response sequence.
+                If not provided, it's set to the model's maximum sequence length minus 1.
+            logprobs (bool, optional): Flag indicating whether to compute token log probabilities. Defaults to False.
+
+        Returns:
+            List[ChatPrediction]: List of chat predictions, each containing the assistant's generated response.
+
+        Raises:
+            AssertionError: If the last message in a dialog is not from the user.
+            AssertionError: If the dialog roles are not in the required 'user', 'assistant', and optional 'system' order.
+
+        Note:
+            This method generates assistant responses for the provided conversational dialogs.
+            It employs nucleus sampling to introduce controlled randomness in text generation.
+            If logprobs is True, token log probabilities are computed for each generated token.
+
+        """
+        if max_gen_len is None:
+            max_gen_len = self.model.params.max_seq_len - 1
+        prompt_tokens:List[List[int]] = []
+        unsafe_requests = [] # shape = [batch_size]
+        
+        for dialog in dialogs:
+            
+            unsafe_requests.append(
+                any([tag in msg['content'] for tag in SPECIAL_TAGS for msg in dialog]) 
+            )
+              
+            if dialog[-1]["role"]== "system":    #  如果第一条是系统消息，将其与下一条用户消息合并
+                dialog = [
+                    {
+                         "role":dialog[1]['role'],   # user
+                         "content": B_SYS  # system begin token
+                            +  dialog[0]["content"]
+                            + E_SYS
+                            +dialog[1]['content'],
+                    },
+                ]+ dialog[2:] # 保留对话中剩余的消息
+                
+        
+            assert all([msg['role']=='user' for msg in dialog[::2]]) and all(
+                [msg['role']=='system' for msg in dialog[1::2]]
+            ),(
+                "model only supports 'system', 'user' and 'assistant' roles, "
+                    "starting with 'system', then 'user' and alternating (u/a/u/a/u...)"
+            )
+
+        
+            dialog_tokens: List[int] = sum(
+                [
+                    self.tokenizer.encode(
+                        f"{B_INST} {prompt['content'].strip()} {E_INST} {answer['content'].strip()}",
+                        bos = True,
+                        eos = True,
+                    )
+                    for prompt ,answer in zip(
+                        dialog[::2], # user
+                        dialog[1::2]
+                    )
+                ],
+                []
+            )
+        
+        
+            assert (dialog[-1]['role'] == "user"), \
+            f"Last message must be from user, got {dialog[-1]['role']}"
+        
+
+            dialog_tokens += self.tokenizer.encode( # 加上对话中的最后一条用户问。
+                f"{E_INST} {dialog[-1]['content'].strip()} {E_INST}",
+                bos = True,
+                eos = True
+            )
+            
+            prompt_tokens.append(dialog_tokens)
+        
+        
+        generation_tokens, generation_logprobs = self.generate(
+            prompt_tokens=prompt_tokens,
+            max_gen_len=max_gen_len,
+            temperature=temperature,
+            top_p=top_p,
+            logprobs=logprobs,
+        ) 
+        # generation_tokens.shape = [batch_size, max_gen_len]
+        # generation_logprobs.shape = [batch_size, max_gen_len]
+        
+        if logprobs:
+            return [
+                {
+                    "generation":{
+                        "role": "assistant",
+                        "content": self.tokenizer.decode(t) if not unsafe else UNSAFE_ERROR,
+                    },
+                    "tokens": [self.tokenizer.decode(x) for x in t],
+                    "logprobs": logprobs_i,
+                }
+                for t, logprobs_i, unsafe in zip(
+                    generation_tokens, generation_logprobs, unsafe_requests # shape = (batch_size, )
+                )
+            ]
+            
+            
+        else:
+            return [
+                {
+                    "generation":{
+                        "role": "assistant",
+                        "content": self.tokenizer.decode(t) if not unsafe else UNSAFE_ERROR,
+                    }   
+                }
+                
+                for t, unsafe in zip(generation_tokens, unsafe_requests)
+            ]
+        
+        
 
 
 
