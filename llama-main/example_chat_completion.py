@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import fire
 
-from llama import Llama, Dialog
+from llama.generation import Llama, Dialog
 
 
 def main(
@@ -84,7 +84,7 @@ If a question does not make any sense, or is not factually coherent, explain why
             }
         ],
     ]
-    results = generator.chat_completion(
+    results = generator.chat_completion(  # List[Dict], 其中， 每个Dict对应了每个dialog的generation结果
         dialogs,  # type: ignore
         max_gen_len=max_gen_len,
         temperature=temperature,
@@ -92,8 +92,9 @@ If a question does not make any sense, or is not factually coherent, explain why
     )
 
     for dialog, result in zip(dialogs, results):
-        for msg in dialog:
+        for msg in dialog: # 遍历每个dialog中的每个msg (历史记录)
             print(f"{msg['role'].capitalize()}: {msg['content']}\n")
+        
         print(
             f"> {result['generation']['role'].capitalize()}: {result['generation']['content']}"
         )

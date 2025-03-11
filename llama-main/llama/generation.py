@@ -204,9 +204,9 @@ class Llama:
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos) # shape = (bsz, prompt_len + seq_len, vocab_size)
             token_logprobs = -F.cross_entropy(
-                input = logits.transpose(1,2),  # shape = (bsz, vocab_size, prompt_len + seq_len)
-                target = tokens ,  # shape = (bsz, prompt_len + seq_len)
-                reduction = "none",
+                input = logits.transpose(1,2),     # shape = (bsz, vocab_size, prompt_len + seq_len)
+                target = tokens ,               # shape = (bsz, prompt_len + seq_len)
+                reduction = "none",     # 表示不进行求和或平均，返回每个位置的损失值
                 ignore_index = pad_id,
             ) # shape = (bsz, prompt_len + seq_len)
         
@@ -447,7 +447,7 @@ class Llama:
         # generation_logprobs.shape = [batch_size, max_gen_len]
         
         if logprobs:
-            return [
+            return [    # 每个点dialog对应一个generation
                 {
                     "generation":{
                         "role": "assistant",
