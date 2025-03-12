@@ -111,3 +111,131 @@ class Qwen2Config(PretrainedConfig):
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
+    
+    
+    
+    model_type = "qwen2"
+    keys_to_ignore_at_inference = ["past_key_values"]
+    
+    
+    # Default tensor parallel plan for base model `Qwen2`
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
+    
+    '''
+    "colwise"：按列切分，通常用于线性层的输入维度
+    "rowwise"：按行切分，通常用于线性层的输出维度
+    
+    在本例中， Q矩阵是按列切分的，K也是按列切分，这样K^T才是按行切分
+        总之，在矩阵乘法中，左侧矩阵均按列切分，右侧矩阵均按行切分。
+    '''
+    
+    
+    base_model_pp_plan = {
+        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+        "norm": (["hidden_states"], ["hidden_states"]),
+    }
+    
+    '''
+    base_model_pp_plan 这个字典定义了 Qwen2 模型在流水线并行（Pipeline Parallelism）下的切分策略。它指定了模型中不同模块的输入和输出应该如何在不同 GPU 之间传递。
+
+    具体来说：
+        字典的键表示模型中的特定模块
+        字典的值是一个元组，包含两个列表：
+        第一个列表：模块的输入参数
+        第二个列表：模块的输出结果
+    
+    这种配置主要用于：
+        将模型的不同层分布到多个 GPU 上
+        优化 GPU 之间的数据传输
+        实现高效的流水线并行计算
+    
+    '''
+    
+    
+    
+    
+    def __init__(
+        self,
+        vocab_size=151936,
+        hidden_size=4096,
+        intermediate_size=22016,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        hidden_act="silu",
+        max_position_embeddings=32768,
+        initializer_range=0.02,  # std
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        tie_word_embeddings=False,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        use_sliding_window=False,
+        sliding_window=4096,
+        max_window_layers=28,
+        attention_dropout=0.0,
+        **kwargs,
+    ):
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.use_sliding_window = use_sliding_window
+        self.sliding_window = sliding_window  # we check `use_sliding_window` in the modeling code
+        self.max_window_layers = max_window_layers
+        
+        
+        
+        # for backward compatibility
+        if num_key_value_heads is None:
+            num_key_value_heads = num_attention_heads
+
+        
+        self.num_key_value_heads = num_key_value_heads
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range  # 权重初始化时的std
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
+        self.attention_dropout = attention_dropout
+        
+        # Validate the correctness of rotary position embeddings parameters
+        # BC: if there is a 'type' field, move it to 'rope_type'.
+        if self.rope_scaling is not None and "type" in self.rope_scaling:
+            self.rope_scaling["rope_type"] = self.rope_scaling["type"]
+        rope_config_validation(self)
+        
+        
+        '''
+        为什么使用 tie_word_embeddings?
+        
+            1. tie_word_embeddings 这个参数用于控制模型的输入词嵌入（input embeddings）和输出词嵌入（output embeddings）是否共享权重。
+
+        具体来说：
+
+            1. 当设置为 True 时，模型的输入词嵌入和输出词嵌入将使用相同的权重矩阵。这意味着模型在将输入token转换为向量表示和将隐藏状态转换回token预测时使用相同的嵌入空间。
+            2. 当设置为 False 时，输入和输出将使用不同的权重矩阵。
+        
+        这种设计的主要优点包括：
+            1. 减少模型参数数量，从而降低内存占用
+            2. 有助于模型训练更稳定
+            3. 在语言模型中，这种设计通常能带来更好的性能
+        
+        '''
+        
+        super().__init__(
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )

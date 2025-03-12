@@ -182,7 +182,103 @@ class Qwen2RMSNorm(nn.Module):
 
 
 
+class Qwen2DecoderLayer(nn.Module):
+    def __init__(self, config: Qwen2Config, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
+        self.mlp = Qwen2MLP(config)
+        
+        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
 
+        if config.sliding_window and config._attn_implementation != "flash_attention_2":
+            logger.warning_once(
+                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
+                "unexpected results may be encountered."
+            )
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC (backward compatibility)
+        **kwargs: Unpack[FlashAttentionKwargs],
+    )->Tuple:
+        
+        residual = hidden_states
+        
+        hidden_states = self.input_layernorm(hidden_states)
+        
+        # Self Attention
+        hidden_states, self_attn_weights = self.self_attn.forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        
+        hidden_states = residual + hidden_states
+        
+        # Fully Connected
+        residual  = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = hidden_states + residual
+        
+        
+        outputs = (hidden_states, )
+        
+        
+        if output_attentions:
+            outputs += (self_attn_weights)
+            
+        return outputs
+        
+        
+
+
+
+
+
+class Qwen2RotaryEmbedding(nn.Module):
+    def __init__(self, config:Qwen2Config, device = None):
+        super().__init__()
+         # BC: "rope_type" was originally "type"
+         
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            pass
+        else:
+            pass
+        
+        
+        self.config = config
+        
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[]
+        
+        
+        
+        
+    def _dynamic_frequency_update(self):
+        pass
+    
+    
+    
+    @torch.no_grad()
+    def forward(self):
+        pass    
+        
 
 
 
@@ -235,21 +331,212 @@ class Qwen2PreTrainedModel(PreTrainedModel):
 
 
 
+
+
+
+QWEN2_INPUTS_DOCSTRING = r"""
+    Args:
+        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
+            it.
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
+
+            [What are input IDs?](../glossary#input-ids)
+        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+
+            [What are attention masks?](../glossary#attention-mask)
+
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            [`PreTrainedTokenizer.__call__`] for details.
+
+            If `past_key_values` is used, optionally only the last `input_ids` have to be input (see
+            `past_key_values`).
+
+            If you want to change padding behavior, you should read [`modeling_opt._prepare_decoder_attention_mask`]
+            and modify to your needs. See diagram 1 in [the paper](https://arxiv.org/abs/1910.13461) for more
+            information on the default strategy.
+
+            - 1 indicates the head is **not masked**,
+            - 0 indicates the head is **masked**.
+        position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
+            config.n_positions - 1]`.
+
+            [What are position IDs?](../glossary#position-ids)
+        past_key_values (`Cache` or `tuple(tuple(torch.FloatTensor))`, *optional*):
+            Pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
+            blocks) that can be used to speed up sequential decoding. This typically consists in the `past_key_values`
+            returned by the model at a previous stage of decoding, when `use_cache=True` or `config.use_cache=True`.
+
+            Two formats are allowed:
+            - a [`~cache_utils.Cache`] instance, see our
+            [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache);
+            - Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of
+            shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`). This is also known as the legacy
+            cache format.
+
+            The model will output the same cache format that is fed as input. If no `past_key_values` are passed, the
+            legacy cache format will be returned.
+
+            If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't
+            have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`
+            of shape `(batch_size, sequence_length)`.
+        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
+            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
+            model's internal embedding lookup matrix.
+        use_cache (`bool`, *optional*):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`).
+        output_attentions (`bool`, *optional*):
+            Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
+            tensors for more detail.
+        output_hidden_states (`bool`, *optional*):
+            Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
+            more detail.
+        return_dict (`bool`, *optional*):
+            Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. Contrarily to `position_ids`,
+            this tensor is not affected by padding. It is used to update the cache in the correct position and to infer
+            the complete sequence length.
+"""
+
+
+
+
+
+
 @add_start_docstrings(
     "The bare Qwen2 Model outputting raw hidden-states without any specific head on top.",
     QWEN2_START_DOCSTRING,
 )
-class Qwen2Model(nn.Module):
+class Qwen2Model(Qwen2PreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`Qwen2DecoderLayer`]
 
     Args:
         config: Qwen2Config
     """
+    
+    
+    def __init__(self, config:Qwen2Config):
+        super.__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        
+        self.embed_tokens = nn.Embedding()
+        
+        self.layers = nn.ModuleList(
+            [
+                Qwen2DecoderLayer(config, i)
+                for i in range(config.num_hidden_layers) 
+            ]
+        )
+        
+        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+        
+        # Initialize weights and apply final processing
+        self.post_init()
+    
+    
+    
+    def get_input_embeddings(self):
+        return self.embed_tokens
 
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+        
+        
+    @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None, # 本质上还是 Tuple[Tuple[Tensor]]
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None, # 历史记录的长度，同时也是当前记录的真正起始位置。
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
+            )
+            use_cache = False
+            
+            
+        if inputs_embeds == None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
+            
+            
+            
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length()
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+            
+            
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+            
+        causal_mask = self.update_causal_mask(
+            
+        )
+        
+        hidden_states = inputs_embeds
+        
+        position_embeddings = self.rotary_emb()
+        
+        
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attn = () if output_attentions else None
+        
+        for decoder_layer in self.layers[]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+                
+                
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    
+                )
+                
+            hidden_states = layer_outputs[0]
+        
 
 
 class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
