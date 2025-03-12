@@ -74,17 +74,84 @@ QWen_PRETRAINED_MODEL_ARCHIVE_LIST = ["qwen-7b"]
 
 
 class FlashSelfAttention(nn.Module):
-    def __init__(self, config: QWenConfig):
+    def __init__(
+        self, 
+        causal=False,
+        softmax_scale=None,
+        attention_dropout=0.0,
+        ):
         super().__init__()
-        self.config = config
-        self.n_heads = config.n_heads
+        assert flash_attn_unpadded_func is not None, (
+            "Please install FlashAttention first, " "e.g., with pip install flash-attn"
+        )
+        assert (
+            rearrange is not None
+        ), "Please install einops first, e.g., with pip install einops"
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
         
         
+    def forward(self, q, k, v):
+        assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q, k, v)))
+        assert all((i.is_cuda for i in (q, k, v)))
+        batch_size, seqlen_q = q.shape[0], q.shape[1]
+        seqlen_k = k.shape[1]
+        # rearrange 是 einops 库中的一个函数，用于对张量进行维度的重新排列和重塑。
+            # b 表示 batch size（批次大小）
+            # s 表示 sequence length（序列长度）
+            # ... 表示剩余的维度
+            # 具体来说，它将 b 和 s 这两个维度合并为一个维度 (b s)，而保持其他维度不变。  
+        q, k, v = [rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v]]
+        
+        # FlashAttention 的输入：FlashAttention 需要知道每个序列在合并后的张量中的位置，以便正确处理不同长度的序列。
+        
+        # 它是一个一维张量，长度为 batch_size + 1，其中每个元素表示当前批次中所有序列的累积长度
+        # 例如，如果批次中有两个序列，长度分别为 3 和 5，那么 cu_seqlens_q 将是 [0, 3, 8]。
+        # 它的主要作用是告诉 FlashAttention 每个序列在合并后的张量中的起始和结束位置。
+        cu_seqlens_q = torch.arange( # 用于 FlashAttention 的累积序列长度（cumulative sequence lengths）数组
+            0,
+            (batch_size + 1) * seqlen_q,
+            step=seqlen_q,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        
+        if self.training:
+            assert seqlen_k == seqlen_q
+            is_causal = self.causal
+            cu_seqlens_k = cu_seqlens_q
         
         
+        else:
+            is_causal = seqlen_q == seqlen_k
+            cu_seqlens_k = torch.arange(
+                0,
+                (batch_size +1)* seqlen_k,
+                step = seqlen_k,
+                dtype = torch.int32,
+                device=q.device,
+            )
+            
+            self.dropout_p = 0
+            
         
+        output = flash_attn_unpadded_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            self.dropout_p,
+            softmax_scale=self.softmax_scale,
+            causal=is_causal,
+        )
+        
+        output = rearrange(output, "(b s) ... -> b s ...", b=batch_size) # shape = [batch_size, seqlen_q, hidden_size]
 
-
+        return output
 
 
 
@@ -171,17 +238,51 @@ class QWenMLP(nn.Module):
 class QwenBlock(nn.Module):
     def __init__(self, config: QWenConfig, layer_idx=None, num_expert=1):
         super().__init__()
-        self.config = config
         self.layer_number = layer_idx
         self.num_expert = num_expert
         self.hidden_size = config.hidden_size
         
+        self.apply_residual_connection_post_layernorm = (
+            config.apply_residual_connection_post_layernorm
+        )
+        
+        self.bf16 = config.bf16
+        
+        self.ln_1 = RMSNorm(
+            
+        )
+        
+        self.attn = QWenAttention(
+            config = config, layer_number = layer_idx,
+        )
+        
+        self.ln_2 = RMSNorm(
+            
+        )
+        
+        self.mlp = QWenMLP(
+            config = config,
+        )
+        
         
     
     
-    def forward(self):
-        pass
-    
+    def forward(
+        self,
+        hidden_states: Optional[Tuple[torch.FloatTensor]],
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ):
+        layernorm_output = self.ln_1(hidden_states)
+
+        attn_outputs = self.attn(
+            
+        )
     
     
     
@@ -240,3 +341,42 @@ class QwenModel(QwenPretrainedModel):
         self.h = nn.ModuleList(
             []
         )
+        
+        
+        
+        
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight =  nn.Parameter(torch.ones(dim))
+        
+        
+    def _norm(self, x):
+        pass
+    
+    
+    
+    
+    def forward(self, x):
+        if rms_norm is not None and x.is_cuda:
+            return rms_norm(x, self.weight, self.eps)
+        else:
+            output = self._norm(x.float()).type_as(x)
+            
+        return output * self.weight
