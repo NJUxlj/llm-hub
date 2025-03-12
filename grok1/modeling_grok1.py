@@ -398,3 +398,56 @@ class Grok1PretrainedModel(PreTrainedModel):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.zero_()
+            
+            
+            
+
+
+
+
+
+class Grok1Model(Grok1PretrainedModel):
+    def __init__(self, config: Grok1Config, **kwargs) -> None:
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embedding_multiplier_scale = config.embedding_multiplier_scale
+        
+        
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
+        
+        self.layers = nn.ModuleList([
+            DecoderLayer(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                num_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                num_experts=config.num_experts,
+                top_k=config.num_experts_per_tok,
+                max_position_embeddings=config.max_position_embeddings,
+                attn_output_multiplier=config.attn_output_multiplier,
+                max_attn_val=config.max_attn_value,
+                rms_norm_eps=config.rms_norm_eps,
+            )
+            for i in range(config.num_hidden_layers)
+        ])
+        
+        self.norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        self.gradient_checkpoint = False
+        self.post_init()
+        
+    
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+        
+        
+        
+    def _prepare_decoder_attention_mask(
+        self, attention_mask, input_shape, inputs_embeds, past_key_values_length
+    ):
+        pass
