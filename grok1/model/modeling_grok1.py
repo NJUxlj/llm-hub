@@ -577,14 +577,30 @@ class Grok1Model(Grok1PretrainedModel):
         
         
         if inputs_embeds is None:
-            pass
+            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = inputs_embeds * self.embedding_multiplier_scale
         
         
         if HAS_MASK_UTILS:
             # 4d mask is passed through the layers
-            pass
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask,
+                (batch_size, seq_length),
+                inputs_embeds,
+                past_key_values_length,
+            )
         else:
-            pass
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    
+                )
+                
+            attention_mask = self._prepare_decoder_attention_mask(
+                attention_mask,
+                (batch_size, seq_length),
+                inputs_embeds,
+                past_key_values_length,
+            )
         
         
         hidden_states = inputs_embeds

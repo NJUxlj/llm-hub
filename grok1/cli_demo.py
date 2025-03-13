@@ -5,7 +5,9 @@ from transformers import AutoTokenizer, AutoModel
 import readline
 
 
-from model.modeling_grok1 import Grok1ModelForCausalLM
+from typing import Tuple, List
+
+from model.modeling_grok1 import Grok1ModelForCausalLM   # 预训练loss一般就在该模型类的forward函数中实现。
 
 from configs.config import MODEL_PATH, DATA_PATH
 
@@ -21,7 +23,7 @@ clear_command = 'cls' if os_name == 'Windows' else 'clear'
 stop_stream = False
 
 
-def build_prompt(history):
+def build_prompt(history:List[Tuple[str, str]]):
     prompt = "欢迎使用 Grok1 模型，输入内容即可进行对话，clear 清空对话历史，stop 终止程序"
     for query, response in history:
         prompt += f"\n\n用户：{query}"

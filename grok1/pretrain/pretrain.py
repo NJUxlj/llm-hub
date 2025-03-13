@@ -29,13 +29,23 @@ tokenized_dataset = train_dataset.map(tokenize_function, batched=True, remove_co
 # 将长文本拼接后切分为max_seq_length的片段  
 max_seq_length = 512  
 def group_texts(examples):  
+    '''
+    这实际上就是trainer中的packing=True参数的底层实现
+    
+    ## Return
+    返回一个字典，包含按max_seq_length分块后的tokens
+    
+    ## 作用， 把多文本链接成长文本，减少pad id的使用（无效forward pass)
+    '''
     # 将所有tokens拼接起来  
+    # e.g. examples[key] = [[1,2,3,5], [3,4,5,6]] -> sum = [1,2,3,5,3,4,5,6]
     concatenated = {k: sum(examples[k], []) for k in examples.keys()}  
     total_length = len(concatenated[list(examples.keys())[0]])  
     # 截断到可被max_seq_length整除的长度  
     if total_length >= max_seq_length:  
         total_length = (total_length // max_seq_length) * max_seq_length  
     result = {  
+        # 长文本分段 （严格按照 max_seq_length 来切割）
         k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]  
         for k, t in concatenated.items()  
     }  
@@ -57,7 +67,7 @@ training_args = TrainingArguments(
     fp16=True,  
     max_steps=1000,  
     logging_dir="./logs/pretrain",  
-    deepspeed="ds_config.json",  # 请确保该文件存在且配置正确  
+    deepspeed=DEEPSEEK_CONFIG_PATH,  # 请确保该文件存在且配置正确  
     report_to=["swanlab"],        # 确保Swanlab监控已经配置  
     save_steps=500,  
     evaluation_strategy="no"      # 预训练阶段可以不做评估  
