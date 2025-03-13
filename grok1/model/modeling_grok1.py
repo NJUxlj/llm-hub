@@ -592,7 +592,9 @@ class Grok1Model(Grok1PretrainedModel):
         else:
             if attention_mask is None:
                 attention_mask = torch.ones(
-                    
+                    (batch_size, seq_length_with_past),
+                    dtype = torch.bool,
+                    device = inputs_embeds.device
                 )
                 
             attention_mask = self._prepare_decoder_attention_mask(
@@ -602,7 +604,7 @@ class Grok1Model(Grok1PretrainedModel):
                 past_key_values_length,
             )
         
-        
+        # embed positions
         hidden_states = inputs_embeds
         
         if self.gradient_checkpointing and self.training:
@@ -658,7 +660,7 @@ class Grok1Model(Grok1PretrainedModel):
             hidden_states  = layer_outputs[0]
             
             if use_cache:
-                next_decoder_cache += ()
+                next_decoder_cache += (layer_outputs[2 if output_attentions else 1] , )
                 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -666,16 +668,12 @@ class Grok1Model(Grok1PretrainedModel):
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
             
-            
-            
         
         # 所有decoder都走完了
         hidden_states = self.norm(hidden_states)
         
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-            
-            
             
         next_cache = next_decoder_cache if use_cache else None
 
