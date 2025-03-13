@@ -1,6 +1,7 @@
-# llm-hub
-- it's unfinished
-- 实现了多个主流开源模型的 pre-train + finetune 的流程 (仅使用2000个Question-Answering样本)
+# Large Language Model Hub (LLM-Hub)
+- It's still in progress ...
+- 对于chatglm, qwen2, gpt2等主流模型，我们在原有的model architecture 文件的基础上实现了 pre-train + finetune 的流程 (仅使用2000个Question-Answering样本)
+- 90% of the model codes are copyed from huggingface transformers library but with some modifications and lots of chinese comment to help you understand the model architecture.
 
 
 
@@ -18,10 +19,52 @@
 - moss
 - qwen
 - qwen2
+- gpt2
+- t5
+- llava
+- ViT
+
+
+## Project Structure
+- 这里我们就拿`qwen2`模型的文件夹结构举例，其余所有模型都非常类似
+
+
+```Plain Text
+qwen2
+├── README.md
+├── configs
+│   ├── config.py
+│   ├── ds_config.json
+|—— models
+|   ├── __init__.py
+|   ├── modeling_qwen2.py
+|   ├── tokenization_qwen2.py
+|   ├── configuration_qwen2.py
+|—— finetune
+|   ├── __init__.py
+|   ├── sft_trainer.py
+|—— pretrain
+|   ├── __init__.py
+|   ├── pretrain.py
+|—— evaluation
+|   ├── __init__.py
+|   ├── evaluate.py
+|—— utils
+|—— main.py
+|—— cli_demo.py
+|—— web_demo.py
+
+```
+
+
+
+## Running Results
+- all the training process snapshot and training results are stored in `运行结果截图` folder.
 
 
 ## Important Notes
 - `ChatGLM2` only supports transformers version `== 4.41.2`, please downgrade using `pip install transformers==4.41.2`
+
 
 
 ## Updates
