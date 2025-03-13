@@ -128,7 +128,7 @@ class RotaryEmbedding(nn.Module):
         self, dim: int, max_position_embeddings: int = 2048, base: int = 10000
     ) -> None:
         super().__init__()
-        assert dim % 2 == 0
+        assert dim % 2 == 0, f'hidden_dim must be divisible by 2, but get {dim}'
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
@@ -148,16 +148,16 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(
             self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
         )
-
-        freqs = torch.outer(t, self.inv_freq)
+        # 构造一个pos_theta矩阵
+        freqs = torch.outer(t, self.inv_freq) # shape = (seq_len, dim/2)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
+        emb = torch.cat((freqs, freqs), dim=-1)  # shape = (seq_len, dim)
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
+        if seq_len > self.max_seq_len_cached: 
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
         return (
@@ -169,7 +169,17 @@ class RotaryEmbedding(nn.Module):
     
 # Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
+    """
+    Rotates half the hidden dims of the input.
+    
+    ###Code
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+    
+    ### Return
+    return torch.tensor shape = [batch_size, seq_len, hidden_size]
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -185,8 +195,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Args:
         q (`torch.Tensor`): The query tensor.
         k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding. shape = [batch_size, max_seq_len, head_dim]
+        sin (`torch.Tensor`): The sine part of the rotary embedding.  shape = [batch_size, max_seq_len, head_dim]
         position_ids (`torch.Tensor`):
             The position indices of the tokens corresponding to the query and key tensors. For example, this can be
             used to pass offsetted position ids when working with a KV-cache.
@@ -202,8 +212,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """
     
 
-
-
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)  # 扩展到q,k 的对应形状
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    
+    # q*cos: 将查询向量与余弦位置编码逐元素相乘
+    # rotate_half(q)*sin: 先将查询向量旋转一半维度，再与正弦位置编码逐元素相乘
+    q_embed = (q*cos) + (rotate_half(q)*sin)
+    k_embed = (k*cos) + (rotate_half(k)*sin)
+    return q_embed, k_embed
 
 
 
@@ -227,7 +243,43 @@ class MultiHeadAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.attn_output_multiplier = attn_output_multiplier
         self.max_attn_val = max_attn_val
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
         
+        
+        self.q_proj = nn.Linear(hidden_size, self.num_heads * self.head_dim, bias=False)
+        
+        self.k_proj = nn.Linear(hidden_size, self.num_key_value_heads * self.head_dim, bias=False )
+
+        self.v_proj = nn.Linear(hidden_size, self.num_key_value_heads* self.head_dim, bias=False)
+
+        self.o_proj = nn.Linears(self.num_heads*self.head_dim, self.hidden_size, bias=False)
+
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings = max_position_embeddings,
+        )
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        
+        bsz, q_len, _ = hidden_states.size()
+        
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)  
         
         
         
@@ -451,3 +503,189 @@ class Grok1Model(Grok1PretrainedModel):
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length
     ):
         pass
+    
+    
+    
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    )->Union[Tuple, MoeModelOutputWithPast]:
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+        
+        
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            
+            )
+        elif input_ids is not None:
+            pass
+        
+        elif inputs_embeds is not None:
+            pass
+        
+        else:
+            raise ValueError(
+                "You have to specify either input_ids or inputs_embeds"
+            )
+        
+        for idx, decoder_layer in enumerate(self.layers):
+            pass
+        
+        
+        if not return_dict:
+            return tuple(
+                v
+                for v in [
+                    
+                ]
+                if v is not None
+            )
+        
+        else:
+            return MoeModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+                router_logits=all_router_logits,
+            )
+
+    
+    
+    
+
+
+
+
+
+class Grok1ModelForCausalLM(Grok1PretrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+    
+    
+    
+    def __init__(self, config: Grok1Config, **kwargs):
+        super().__init__(config)
+        self.model:Grok1Model = Grok1Model(config)
+        self.vocab_size = config.vocab_size
+        self.output_multiplier_scale = config.output_multiplier_scale
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.router_aux_loss_coef = config.router_aux_loss_coef
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.post_init()
+        
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+    
+    
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+        
+        
+        
+    def get_output_embeddings(self):
+        return self.lm_head
+    
+    
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+        
+        
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+    
+    
+    
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    )->Union[Tuple, MoeCausalLMOutputWithPast]:
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_router_logits = (
+            output_router_logits
+            if output_router_logits is not None
+            else self.config.output_router_logits
+        )
+
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+        
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            return_dict=return_dict,
+        )
+        
+        
+        
+        
+        
+        
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
+    ):
+        pass
+    
