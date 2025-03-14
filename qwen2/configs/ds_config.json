@@ -1,0 +1,78 @@
+{
+    "train_batch_size": "auto",  // 自动计算为per_device_batch_size * GPU数量 * gradient_accumulation_steps
+    "train_micro_batch_size_per_gpu": "auto", // 自动读取TrainingArguments中的per_device_train_batch_size
+    
+    "gradient_accumulation_steps": "auto",     // 自动读取TrainingArguments配置
+    "steps_per_print": 50,      // 与logging_steps同步
+    
+    "zero_optimization": {
+      "stage": 2,               // 全量微调建议stage 3，LoRA类可用stage 2
+      "offload_optimizer": {    // CPU卸载配置
+        "device": "cpu",
+        "pin_memory": true,
+        "fast_init": false
+      },
+      "offload_param": {        // 全量微调时建议启用
+        "device": "cpu",
+        "pin_memory": true,
+        "max_in_cpu": 1e9
+      },
+      "overlap_comm": true,     // 启用通信与计算重叠
+      "contiguous_gradients": true,
+      "reduce_bucket_size": 5e8 // 根据显存调整（2G显存设5e8，8G可设2e9）
+    },
+    
+    "fp16": {                   // 与TrainingArguments的fp16对应
+      "enabled": "auto",
+      "loss_scale": 0,
+      "loss_scale_window": 1000,
+      "initial_scale_power": 16,
+      "hysteresis": 2,
+      "min_loss_scale": 1
+    },
+    
+    "bf16": {                   // A100/A800等支持BF16的GPU可启用
+      "enabled": false
+    },
+    
+    "optimizer": {
+      "type": "AdamW",
+      "params": {
+        "lr": "auto",           // 自动读取TrainingArguments配置
+        "betas": [0.9, 0.95],   // 适用于大语言模型的beta参数
+        "eps": 1e-8,
+        "weight_decay": 0.1,
+        "no_dtype_recognition": false
+      }
+    },
+    
+    "scheduler": {
+      "type": "WarmupDecayLR",
+      "params": {
+        "warmup_min_lr": "auto",
+        "warmup_max_lr": "auto",
+        "warmup_num_steps": "auto",
+        "total_num_steps": "auto"
+      }
+    },
+    
+    "activation_checkpointing": {  // 显存优化（会轻微降低速度）
+      "partition_activations": true,
+      "contiguous_memory_optimization": true,
+      "cpu_checkpointing": true,
+      "number_checkpoints": 4,
+      "synchronize_checkpoint_boundary": false
+    },
+    
+    "flops_profiler": {         // 性能分析工具
+      "enabled": false,
+      "profile_step": 10,
+      "module_depth": -1,
+      "top_modules": 3,
+      "detailed": true
+    },
+    
+    "wandb": {                  // 与SwanLab兼容配置
+      "enabled": false
+    }
+  }
