@@ -282,13 +282,61 @@ class MultiHeadAttention(nn.Module):
         value_states = self.v_proj(hidden_states)  
         
         
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
         
-    
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        
+        
+        kv_seq_len = key_states.shape[-2]
+
+        if past_key_value is not None:
+            kv_seq_len += past_key_value[0].shape[-2]
+
+        
+        cos, sin = self.rotary_emb.forward(value_states, seq_len = kv_seq_len)
+        
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
+        
+        # 将历史记录分别拼接到KV矩阵上
+        if past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = torch.cat([past_key_value[0], key_states], dim = 2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
 
-
-
-
+        # 更新本轮的past_key_value
+        
+        
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv()
+        value_states = repeat_kv()
+        
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)).to(torch.float)
+        
+        attn_weights = attn_weights * self.attn_output_multiplier
+        attn_weights = self.max_attn_val * torch.tanh(attn_weights)
+        
+        
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+            
+        if attention_mask is not None:
+            pass
+        
+        
+        attn_weights = F.softmax(attn_weights, dim=-1)
 
 
 class MoeMLP(nn.Module):
@@ -336,12 +384,19 @@ class MoeBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        
+        # router_logits: (batch * sequence_length, n_experts)
     
-    
-    
-    
-    
-    
+        router_logits = self.gate(hidden_states)
+        routing_weights =  F.softmax(router_logits, dim=-1, dtype = torch.float)    
+
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        ) # (batch * sequence_length, top_k), ()
+        
+        
+        routing_weights =  routing_weights.to(hidden_states.dtype)
     
     
     
@@ -452,9 +507,29 @@ class Grok1PretrainedModel(PreTrainedModel):
             module.weight.data.zero_()
             
             
-            
+
+# Copied from transformers.models.bart.modeling_bart._make_causal_mask
+def _make_causal_mask(
+    input_ids_shape: torch.Size,
+    dtype: torch.dtype,
+    device: torch.device,
+    past_key_values_length: int = 0,
+):
+    """
+    Make causal mask used for bi-directional self-attention.
+    """
 
 
+
+
+
+
+# Copied from transformers.models.bart.modeling_bart._expand_mask
+
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    """
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
 
 
 
@@ -501,8 +576,51 @@ class Grok1Model(Grok1PretrainedModel):
         
     def _prepare_decoder_attention_mask(
         self, attention_mask, input_shape, inputs_embeds, past_key_values_length
-    ):
-        pass
+    ): 
+        '''
+        这段代码的主要作用是准备解码器的注意力掩码(attention mask)，具体功能如下：
+
+        创建因果掩码(Causal Mask)：
+            当输入序列长度大于1时，使用_make_causal_mask函数创建一个下三角形式的因果掩码
+            这种掩码确保每个token只能关注它自身及之前的token，防止信息泄露
+        
+        处理输入注意力掩码：
+            如果传入了attention_mask，使用_expand_mask函数将其扩展到适合注意力机制的四维形状
+            扩展后的掩码形状为[batch_size, 1, target_seq_len, source_seq_len]
+        
+        合并掩码：
+            将因果掩码和扩展后的注意力掩码进行合并
+            如果两者都存在，则进行相加操作
+        
+        返回结果：
+            最终返回一个适合解码器使用的组合注意力掩码
+        '''
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        
+        combined_attention_mask = None
+        if input_shape[-1] >1: # 如果输入序列长度大于1
+            combined_attention_mask = _make_causal_mask(
+                input_shape,
+                inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
+    
+        
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = _expand_mask(
+                attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+            ).to(inputs_embeds.device)
+            
+            combined_attn_mask = (
+                expanded_attn_mask 
+                if combined_attention_mask is None
+                else expanded_attn_mask + combined_attention_mask,
+            )
+            
+        return combined_attention_mask
     
     
     
