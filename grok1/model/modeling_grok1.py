@@ -50,28 +50,86 @@ def load_balancing_loss_func(
         compute_device = gate_logits[0].device
         gate_logits = torch.cat(
             [gate.to(compute_device) for gate in gate_logits], dim=0
-        )
+        ) # shape = [batch_size * num_layers, seqeunce_length, num_experts]
 
     routing_weights, selected_experts = torch.topk(gate_logits, top_k, dim=-1)
-    routing_weights = routing_weights.softmax(dim=-1)
+    routing_weights = routing_weights.softmax(dim=-1) # 
+    
+    # 输出形状：
+    # routing_weights.shape == selected_experts.shape == [batch*num_layers, seq_len, top_k]
 
+ 
     # cast the expert indices to int64, otherwise one-hot encoding will fail
     if selected_experts.dtype != torch.int64:
         selected_experts = selected_experts.to(torch.int64)
 
-    if len(selected_experts.shape) == 2:
-        selected_experts = selected_experts.unsqueeze(2)
+    if len(selected_experts.shape) == 2:  # top_k == 1
+        selected_experts = selected_experts.unsqueeze(2) # shape = [batch_size * num_layers, seqeunce_length, 1]
 
+    # router_logits 经过 topk 操作后得到 selected_experts 是专家索引 (batch*layers, seq_len, top_k)
+    # one_hot 将其转换为三维掩码矩阵 (batch*layer, seq_len, top_k, num_experts)
+    # 每个位置表示该位置的专家是否被选中
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+    
+    # 例如当 selected_experts = [[0,2], [1,3]]，num_experts=4 时：
+    # expert_mask 会变成：
+    # [[[1,0,0,0], [0,0,1,0]],
+    #  [[0,1,0,0], [0,0,0,1]]]
 
     # For a given token, determine if it was routed to a given expert.
+    # 步骤1：合并top_k维度的专家选择结果（每个token可能选择多个专家）
+    # 输入形状：[batch*num_layers, seq_len, top_k, num_experts]
+    # 输出形状：[batch*num_layers, seq_len, num_experts]
     expert_mask = torch.max(expert_mask, axis=-2).values
+    
+    # max操作合并top_k维度后：  
+    [[1,0,1,0],  
+    [0,1,0,1]]  
 
     # cast to float32 otherwise mean will fail
-    expert_mask = expert_mask.to(torch.float32)
+    expert_mask = expert_mask.to(torch.float32) # [batch*num_layers, seq_len, num_experts]
+
+    # 步骤3：计算 对于整个序列，每个专家被选中的平均概率
+    # 沿序列维度（seq_len）求平均，结果形状：[batch*num_layers, num_experts] = [B, E]
     tokens_per_group_and_expert = torch.mean(expert_mask, axis=-2)
 
+    # 步骤4：计算路由权重的平均概率 【每个token选择top-k专家的平均概率】
+    # 输入形状：[batch*num_layers, seq_len, top_k]
+    # 结果形状：[batch*num_layers, seq_len] = [B, S]
     router_prob_per_group_and_expert = torch.mean(routing_weights, axis=-1)
+    
+    # 最终通过二者的点乘计算负载均衡损失： 
+        # $$Loss = E[P_{token}(e) \cdot P_{router}(e)] \cdot N_{experts}^2$$ 
+        # 这惩罚了专家选择分布与路由权重分布不一致的情况。
+        # e 表示 专家索引 0~E-1
+        # P_{token}(e) 表示 专家e被选中的概率
+        # P_{router}(e) 表示 路由选择到专家e的概率
+        
+    # [B,E] * [B,S,1] -> [B,1,E] * [B,S,1] -> [B,S,E] -> 标量
+    
+    
+    '''
+    # 通过unsqueeze(-1)添加新维度
+    router_prob_per_group_and_expert.unsqueeze(-1).shape = [B, S, 1]
+
+    # 广播机制生效后的相乘过程：
+    [B, E]          # tokens_per_group
+        × 
+    [B, S, 1]       # router_prob
+    → 
+    [B, S, E]       # 广播后的乘积结果
+
+    # 最终求均值时的维度：
+    torch.mean([B, S, E]) → 标量
+    
+    这里能够相乘的关键在于PyTorch的广播机制（Broadcasting），具体规则如下：
+        维度对齐：从右向左对齐
+        [B, E] → 实际维度为 [B, 1, E]
+        [B, S, 1] → 保持原状
+    
+    这种设计实际上计算的是专家选择概率与路由概率在所有位置（sequence positions）和所有专家（experts）上的期望乘积，
+        最终通过乘以专家数的平方来放大不平衡惩罚。
+    '''
     return torch.mean(
         tokens_per_group_and_expert * router_prob_per_group_and_expert.unsqueeze(-1)
     ) * (num_experts**2)
@@ -314,16 +372,16 @@ class MultiHeadAttention(nn.Module):
 
 
         # 更新本轮的past_key_value
-        
+        past_key_value = (key_states, value_states) if use_cache else None
         
         # repeat k/v heads if n_kv_heads < n_heads
-        key_states = repeat_kv()
-        value_states = repeat_kv()
+        key_states = repeat_kv(key_states, self.num_key_value_groups) # 一个 group里面包含多个 key_value heads
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
         
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)).to(torch.float)
         
         attn_weights = attn_weights * self.attn_output_multiplier
-        attn_weights = self.max_attn_val * torch.tanh(attn_weights)
+        attn_weights = self.max_attn_val * F.tanh(attn_weights/self.max_attn_val)
         
         
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -333,10 +391,32 @@ class MultiHeadAttention(nn.Module):
             )
             
         if attention_mask is not None:
-            pass
+            if attention_mask.size()!=(bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+        
+            attn_weights = attn_weights + attention_mask
         
         
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = F.softmax(attn_weights, dim=-1).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"attn_output should be size {(bsz, self.num_heads,q_len, self.head_dim)}", 
+                f"but is {attn_output.size()}"
+            )
+            
+        attn_output = attn_output.transpose(1,2).contiguous()
+        attn_output = attn_output.reshape((bsz, q_len, self.hidden_size))
+        
+        attn_output =  self.o_proj(attn_output)
+        
+        if not output_attentions:
+            attn_weights = None
+            
+        return attn_output, attn_weights, past_key_value
 
 
 class MoeMLP(nn.Module):
@@ -519,8 +599,64 @@ def _make_causal_mask(
     Make causal mask used for bi-directional self-attention.
     """
 
+    bsz, tgt_len = input_ids_shape # tgt_len = query_size
+    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
+    mask_cond = torch.arange(mask.size(-1), device=device)
+    
+    # 创建因果注意力掩码，其核心作用是生成一个下三角矩阵，确保自注意力机制只能关注当前位置及之前的token
+    # mask_cond 代表行， (mask_cond+1.view(-1, 1)) 代表列
+    '''
+    mask_cond = torch.tensor([0, 1, 2])  # 位置索引
 
+    # 表达式分解步骤：
+    right_matrix = (mask_cond + 1).view(3, 1)  
+    # 得到 [[1], [2], [3]]
 
+    comparison = mask_cond < right_matrix  
+    # 广播比较生成3x3布尔矩阵：
+    # [[0<1, 0<2, 0<3],   → [True, True, True]
+    #  [1<1, 1<2, 1<3],   → [False, True, True]
+    #  [2<1, 2<2, 2<3]]   → [False, False, True]
+    
+    当执行 mask.masked_fill_(comparison, 0) 后：
+
+    [[ 0,    0,    0],   # 可以关注所有位置
+    [-inf,  0,    0],   # 只能关注位置1及之后
+    [-inf, -inf,  0]]   # 只能关注位置2
+    这实现了：
+
+    对角线及下方区域填充0（允许关注）
+    上方区域保持-inf（禁止关注）
+    '''
+    
+    mask.masked_fill(mask_cond <(mask_cond+1).view(mask.size(-1), 1), 0)
+    
+    # 修正后的比较条件：
+    # mask.masked_fill(mask_cond[:, None] >= (mask_cond[None, :] + 1), 0)
+    
+    mask = mask.to(dtype)
+    
+    if past_key_values_length > 0:
+        mask = torch.cat(
+            [
+                torch.zeros(
+                    tgt_len, past_key_values_length, dtype=dtype, device=device
+                ),
+                mask, # shape = (tgt_len, tgt_len)
+            ]
+            ,dim=-1
+            ) # shape = (tgt_len, tgt_len + past_key_values_length)
+        
+    '''
+    假设 tgt_len ==3, past_len =1 拼接完毕后就是:
+        [[0, 0,    0,    0],   # 可以关注所有位置
+        [0, -inf,  0,    0],   # 只能关注位置1及之后
+        [0, -inf, -inf,  0]]   # 只能关注位置2 
+    
+    '''
+    return mask[None,None,:,:].expand(
+        bsz, 1, tgt_len, tgt_len + past_key_values_length
+    )
 
 
 
@@ -529,8 +665,73 @@ def _make_causal_mask(
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
-    """
+    
+    src_len（源序列长度）
+        指当前输入的序列长度（不含历史信息），即attention_mask的原始维度 [bsz, src_len] 中的第二个维度
 
+    tgt_len（目标序列长度）
+        指要生成的序列长度（解码器侧），默认与src_len相同。当需要处理不同长度的输入输出时（如机器翻译），两者会不同
+
+    与past_key_value_length的关系
+        这两个参数不包含past_key_value_length
+    
+    mask： padding掩码，举例：
+
+    假设原始mask为：
+
+        mask = torch.tensor([[1, 1, 0]])  # bsz=1, src_len=3
+        tgt_len = 4
+        dtype = torch.float32
+        
+        经过代码处理后：
+        expanded_mask = mask[:, None, None, :]  # shape [1, 1, 1, 3]
+                .expand(1, 1, 4, 3)        # shape [1, 1, 4, 3]
+                .to(torch.float32)
+        
+        最终得到四维张量：
+        # 形状：[1, 1, 4, 3]
+        tensor([[
+            [
+                [1.0, 1.0, 0.0],  # 目标位置1的掩码
+                [1.0, 1.0, 0.0],  # 目标位置2的掩码
+                [1.0, 1.0, 0.0],  # 目标位置3的掩码
+                [1.0, 1.0, 0.0]   # 目标位置4的掩码
+            ]
+        ]], dtype=torch.float32)
+        
+        后续经过inverted_mask = 1.0 - expanded_mask和掩码填充后，会变成：
+        tensor([[
+            [
+                [0.0, 0.0, -inf],  # 目标位置1的最终掩码
+                [0.0, 0.0, -inf],  # 目标位置2的最终掩码 
+                [0.0, 0.0, -inf],  # 目标位置3的最终掩码
+                [0.0, 0.0, -inf]   # 目标位置4的最终掩码
+            ]
+        ]])
+        
+        这样每个目标位置都会：
+
+        看到完整的源序列（src_len=3）
+        对填充位置（第3列）应用-inf
+    """
+    
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len   # tgt_len == query_size
+    
+    expanded_mask = mask[:,None,None,:].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    
+    # 将原来的掩码取反
+    '''
+    将原始掩码值反转（1变0，0变1），因为：
+    原始掩码中的1表示有效token，0表示填充token
+    转换后，填充位置会被赋予极大负值（在softmax后趋近于0）
+    '''
+    inverted_mask = 1 - expanded_mask
+    
+    # 用极小值填充掩码区域（使softmax后接近0）
+    return inverted_mask.masked_fill(
+        
+    )
 
 
 class Grok1Model(Grok1PretrainedModel):
@@ -600,7 +801,7 @@ class Grok1Model(Grok1PretrainedModel):
         
         combined_attention_mask = None
         if input_shape[-1] >1: # 如果输入序列长度大于1
-            combined_attention_mask = _make_causal_mask(
+            combined_attention_mask = _make_causal_mask(  # 历史记录对应的掩码
                 input_shape,
                 inputs_embeds.dtype,
                 device=inputs_embeds.device,
@@ -610,7 +811,7 @@ class Grok1Model(Grok1PretrainedModel):
         
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = _expand_mask(
+            expanded_attn_mask = _expand_mask(  # 当前输入序列对应的掩码
                 attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
             ).to(inputs_embeds.device)
             
@@ -917,7 +1118,50 @@ class Grok1ModelForCausalLM(Grok1PretrainedModel):
         )
         
         
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states) * self.output_multiplier_scale
+
+        logits = logits.float()
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()   # "今天天气很" 
+            shift_labels = labels[..., 1:].contiguous()       # "天天气很好"
+            # Flatten the tokens
+            loss_fct = nn.CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size) # shape = (bsz * seqlen, vocab_size)
+            shift_labels = shift_labels.view(-1)   # shape = (bsz * seqlen)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+            
+        aux_loss = None
+        if output_router_logits:
+            aux_loss = load_balancing_loss_func(
+                outputs.router_logits, # 所有layer的router_logits形成的元组
+                self.num_experts,
+                self.num_experts_per_tok,
+            ) 
+            
+            if labels is not None:
+                loss += self.router_aux_loss_coef * aux_loss
         
+        
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            if output_router_logits:
+                output = (aux_loss,) + output
+            return ((loss,) + output) if loss is not None else output
+        
+        
+        return MoeCausalLMOutputWithPast(
+            loss=loss,
+            aux_loss=aux_loss,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
         
         
         
@@ -929,5 +1173,41 @@ class Grok1ModelForCausalLM(Grok1PretrainedModel):
         inputs_embeds=None,
         **kwargs,
     ):
-        pass
-    
+        # 如果有缓存，说明不是第一次生成，只需保留最后一个token
+        if past_key_values:
+            input_ids = input_ids[:, -1:]   # 保持二维形状 [batch_size, 1]
+            
+        # 处理位置编码
+        position_ids = kwargs.get("position_ids", None)
+        
+        if attention_mask is not None and position_ids is None:
+            # 动态生成位置ID：cumsum累计求和-1得到绝对位置
+            # 例如 attention_mask = [1,1,1] → [0,1,2]
+            position_ids = attention_mask.long().cumsum(-1)-1
+            
+            # 将padding位置设为1（避免无效位置影响）
+            position_ids.masked_fill(attention_mask==0, 1)
+
+            # 如果有缓存，只需使用最后一个位置
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1) # # [batch_size, 1]
+                
+                
+        
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            # 只在第一次生成时使用embedding输入
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+           
+        
+        # 组装最终输入字典
+        model_inputs.update({
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,  # 历史缓存
+            "use_cache": kwargs.get("use_cache"),  # 是否使用缓存加速
+            "attention_mask": attention_mask,  # 注意力掩码
+        })
+        
+        return model_inputs
