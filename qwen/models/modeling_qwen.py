@@ -491,28 +491,135 @@ class QWenModel(QWenPreTrainedModel):
         
         
         if token_type_ids is not None:
-             pass
-         
+             token_type_ids = token_type_ids.view(-1, input_shape[-1])
          
         if position_ids is not None:
-             pass
+             position_ids = position_ids.view(-1, input_shape[-1])
          
          
         if past_key_values is None:
-            pass
+            past_length = 0
+            past_key_values = tuple([None] * len(self.h))  # 长度为num_hidden_layers（模型总层数）的元组
         else:
-            pass
+            past_length = past_key_values[0][0].size(-2)
         
         
         
         if position_ids is None:
-            pass
-        
+            position_ids = torch.arange(
+                past_length,
+                past_length + input_shape[-1],
+                dtype = torch.long,
+                device = device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
         
         
         
         if attention_mask is not None:
-            pass
+            if batch_size <=0:
+                raise ValueError("batch_size has to be defined and > 0")
+            attention_mask = attention_mask.view(batch_size, -1)
+            attention_mask = attention_mask[:,None,None,:]
+
+            attention_mask  = attention_mask.to(dtype=self.dtype)
+            '''
+            1 1 1 0
+            1 1 1 0
+            1 1 1 0
+            
+            置返
+            
+            0 0 0 1
+            0 0 0 1
+            0 0 0 1
+            
+            1 变为 -无穷
+            0 0 0 -inf
+            0 0 0 -inf
+            0 0 0 -inf
+            '''
+            
+            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+            
+        
+        encoder_attention_mask = None
+        head_mask = self.get_head_mask(head_mask, self.config.n_layers)
+        
+        if inputs_embeds is None:
+            inputs_embeds = self.wte(input_ids)
+            
+        hidden_states = inputs_embeds
+        
+        if self.wpe is not None:
+            posiiton_embeds = self.wpe(position_ids)
+            hidden_states = hidden_states + posiiton_embeds
+            
+        hidden_states = self.dropout(hidden_states)
+
+        output_shape = input_shape + (hidden_states.size(-1),) # shape = [batch_size, seqlen, hidden_size]
+        
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+                
+                
+                
+        presents= () if use_cache else None
+        all_self_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        
+        
+        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+                
+            if self.gradient_checkpointing and self.training:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module.forward(inputs, use_cache, output_attentions)
+                    
+                    return custom_forward
+                
+                
+                outputs = torch.utils.checkpoint.checkpoint(
+                    
+                )
+                
+            else:
+                block:QWenBlock
+                outputs = block.forward(
+                    
+                )
+                
+                
+            hidden_states = outputs[0]
+            
+            if use_cache:
+                presents = presents + (outputs[2 if output_attentions else 1], )
+                
+                
+            if output_attentions:
+                all_self_attentions += (outputs[1],)
+        
+        hidden_states = self.ln_f(hidden_states)
+        
+        hidden_states = hidden_states.view(output_shape)
+        
+        if not return_dict:
+            return tuple(
+                v for v in [hidden_states, presents, all_hidden_states] if v is not None
+            )
+        
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=presents,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
 
 
 
@@ -591,6 +698,100 @@ class QWenLMHeadModel(QWenPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
+        
+        
+        
+        
+    @staticmethod
+    def _reorder_cache():
+        pass
+    
+    
+    
+    
+    def chat(self):
+        pass
+    
+    
+    
+    
+    
+    def generate(self):
+        pass
+
+
+
+
+
+
+
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.inv_freq = 1.0 /(base**(torch.arange(0, dim, 2).float()/dim))
+        
+        if importlib.util.find_spec("einops") is None:
+            raise RuntimeError("einops is required for Rotary Embedding")
+        
+        
+        self._rotary_emb_pos_cache = None
+        self._seq_len_cached = 0
+        self._ntk_alpha_cached = 1.0
+        
+    def update_rotary_pos_emb_cache(self, max_seq_len, offset=0, ntk_alpha=1.0):
+        
+        seqlen  =  max_seq_len + offset
+        
+        if seqlen > self._seq_len_cached and ntk_alpha != self._ntk_alpha_cached:
+            base = ""
+            inv_freq = ""
+            
+            
+            self._seq_len_cached = seqlen
+            
+            self._ntk_alpha_cached = ntk_alpha
+
+        
+            seq = torch.arange(seqlen, device=self.inv_freq.device) # 创建一个position'序列
+            freqs = torch.outer(seq.type_as(), self.inv_freq.device)
+            
+            emb = torch.cat((freqs, freqs), dim=-1)  # shape = [seqlen, dim]
+            
+            
+            from einops import arrange
+            
+            self._rotary_emb_pos_cache = rearrange(emb, "n d -> 1 n 1 d")
+            
+    
+    
+    
+    def forward(self, max_seq_len, offset=0, ntk_alpha=1.0):
+        pass
+        
+
+
+def _rotate_half(x: torch.Tensor):
+    from einops import rearrange # 动态导入张量重塑库
+    
+    # 将输入张量的最后一个维度分割为2个子维度
+    # 例如：形状从 [..., 256] -> [..., 2, 128]
+    x = rearrange(x, "... (j d) -> ... j d", j=2)
+    
+    # 沿倒数第二个维度解绑张量，得到两个子张量
+    # x1形状：[..., 128], x2形状：[..., 128]
+    x1, x2 = x.unbind(dim=-2)
+    return torch.cat((-x2, x1), dim=-1)
+    
+
+
+
+
+def apply_rotary_pos_emb(t, freqs):
+    pass
+
+
 
 
 
@@ -608,8 +809,6 @@ class RMSNorm(torch.nn.Module):
         
         return output
 
-    
-    
     
     def forward(self, x):
         if rms_norm is not None and x.is_cuda:
