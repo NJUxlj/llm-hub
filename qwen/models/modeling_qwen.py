@@ -578,7 +578,7 @@ class QWenModel(QWenPreTrainedModel):
                 all_hidden_states += (hidden_states,)
                 
             if self.gradient_checkpointing and self.training:
-                def create_custom_forward(module):
+                def create_custom_forward(module:QWenBlock):
                     def custom_forward(*inputs):
                         return module.forward(inputs, use_cache, output_attentions)
                     
@@ -586,16 +586,29 @@ class QWenModel(QWenPreTrainedModel):
                 
                 
                 outputs = torch.utils.checkpoint.checkpoint(
-                    
+                    create_custom_forward(block),
+                    hidden_states,
+                    None,
+                    attention_mask,
+                    head_mask[i],
+                    encoder_hidden_states,
+                    encoder_attention_mask,
                 )
                 
             else:
                 block:QWenBlock
                 outputs = block.forward(
-                    
+                    hidden_states,
+                    layer_past=layer_past,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask[i],
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
                 )
                 
-                
+  
             hidden_states = outputs[0]
             
             if use_cache:
@@ -606,7 +619,6 @@ class QWenModel(QWenPreTrainedModel):
                 all_self_attentions += (outputs[1],)
         
         hidden_states = self.ln_f(hidden_states)
-        
         hidden_states = hidden_states.view(output_shape)
         
         if not return_dict:
