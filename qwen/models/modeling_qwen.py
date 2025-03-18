@@ -741,24 +741,57 @@ class RotaryEmbedding(torch.nn.Module):
         self._ntk_alpha_cached = 1.0
         
     def update_rotary_pos_emb_cache(self, max_seq_len, offset=0, ntk_alpha=1.0):
-        
-        seqlen  =  max_seq_len + offset
-        
-        if seqlen > self._seq_len_cached and ntk_alpha != self._ntk_alpha_cached:
-            base = ""
-            inv_freq = ""
-            
-            
-            self._seq_len_cached = seqlen
-            
-            self._ntk_alpha_cached = ntk_alpha
+        '''
+        ##参数详解：
 
+        max_seq_len（核心参数）：
+            当前处理的最大序列长度
+            决定需要生成的位置编码的长度
+            典型应用：处理输入序列时根据实际长度动态调整
+        offset=0（扩展参数）：
+            序列起始偏移量
+            用于处理分段序列或缓存复用场景
+            示例：当处理第1000-2000个token时，offset=1000
+        ntk_alpha=1.0（NTK关键参数）：
+            Neural Tangent Kernel缩放系数
+            用于动态调整基值(base)实现上下文长度外推
+            >1时扩展模型上下文窗口，<1时收缩窗口
+
+            典型值范围：1.0-4.0（根据任务调整）
         
+        
+        技术特点：
+            动态缓存机制：只在序列长度超过缓存或参数变化时重新计算，提升效率
+            NTK-aware编码：通过ntk_alpha实现无需训练的长度外推
+            复数形式编码：通过cat操作实现复数表示（cosθ + i*sinθ）
+            设备一致性：保持计算设备与原始参数一致（GPU/CPU）
+        
+        典型应用场景：
+            处理超长文本输入时自动扩展上下文窗口
+            流式处理中动态更新位置编码
+            复用已有位置编码缓存提升推理速度
+            该方法属于旋转位置编码的优化实现，通过动态调整编码参数来平衡计算效率和模型性能。
+        '''
+        # seqlen = 当前需要处理的序列长度 = 最大序列长度 + 偏移量
+        seqlen  =  max_seq_len + offset
+        # 当遇到更长的序列或缩放系数变化时更新缓存
+        if seqlen > self._seq_len_cached and ntk_alpha != self._ntk_alpha_cached:
+            # 应用NTK-aware缩放后的基值计算
+            base = base * ntk_alpha**(self.dim/(self.dim-2))
+             # 重新计算频率倒数（核心的旋转位置参数）
+            inv_freq = 1.0 / (
+                base **(torch.arange(0, self.dim, 2, device=self.inv_freq.device).float()/self.dim)
+            )
+            
+            # 更新缓存记录值
+            self._seq_len_cached = seqlen
+            self._ntk_alpha_cached = ntk_alpha
             seq = torch.arange(seqlen, device=self.inv_freq.device) # 创建一个position'序列
-            freqs = torch.outer(seq.type_as(), self.inv_freq.device)
+            # 构造一个从 pos-> freqs的矩阵
+            freqs = torch.outer(seq.type_as(self.inv_freq), self.inv_freq)
             
+            # 拼接实部和虚部（形成复数表示）
             emb = torch.cat((freqs, freqs), dim=-1)  # shape = [seqlen, dim]
-            
             
             from einops import arrange
             
@@ -768,7 +801,10 @@ class RotaryEmbedding(torch.nn.Module):
     
     
     def forward(self, max_seq_len, offset=0, ntk_alpha=1.0):
-        pass
+        self.update_rotary_pos_emb_cache(max_seq_len, offset, ntk_alpha)
+        return self._rotary_emb_pos_cache[:,offset: offset+max_seq_len]
+        
+        
         
 
 
@@ -789,10 +825,34 @@ def _rotate_half(x: torch.Tensor):
 
 
 def apply_rotary_pos_emb(t, freqs):
-    pass
-
-
-
+    '''
+    确定旋转维度：从 freqs 张量的最后一个维度获取旋转维度 rot_dim。
+    分割输入张量：将输入张量 t 分割为两部分：t_ 包含前 rot_dim 个元素，t_pass_ 包含剩余元素。
+    转换数据类型：将 t_ 和 t_pass_ 转换为浮点类型。
+    
+    应用旋转位置编码：对 t_ 应用旋转位置编码公式：
+    首先，计算 freqs 的余弦值，并与 t_ 逐元素相乘。
+    然后，调用 _rotate_half 函数对 t_ 进行半旋转操作，并计算 freqs 的正弦值，将两者逐元素相乘。
+    最后，将上述两个结果相加，得到编码后的 t_。
+    合并张量：将编码后的 t_ 和 t_pass_ 沿着最后一个维度拼接起来，得到最终的编码结果。
+    
+    '''
+    if apply_rotary_emb_func is not None:
+        _t = t 
+        freqs = freqs.squeeze(0).squeeze(1) # shape = [seqlen, dim]
+        cos = freqs[:, :freqs.shape[-1]//2].cos()   # freqs.shape[-1] == dim
+        sin = freqs[:, freqs.shape[-1]//2:].sin()
+        output =  apply_rotary_emb_func(_t, cos, sin).type_as(t)
+        
+        return output
+    
+    else:
+        rot_dim = freqs.shape[-1]
+        t_, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+        t_ = t_.float()
+        t_pass = t_pass.float()
+        t_ = (t_ * freqs.cos()) + (_rotate_half(t_)* freqs.sin())
+        return torch.cat([t_, t_pass],dim=-1).type_as(t)
 
 
 class RMSNorm(torch.nn.Module):
