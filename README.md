@@ -69,7 +69,13 @@ qwen2
 
 ## Updates
 1. `ChatGLM2` is already finished with comprehensive explaination and comment added to the files.
-2. now we are working on Qwen and Llama.
+2. `llama` modeling file is finished and commented, but you can not run it now because some API in `llama` is too old, we want to focus on the latest models like qwen who largely applies `transformers` library.
+3. `qwen` is finished with the following content:
+    - `qwen` modeling file is finished and commented.
+    - `qwen` finetuning file `finetune_standard.py` is finished and commented.
+    - `qwen` pretraining file `pretrain.py` is finished and commented.
+    - `qwen` gptq quantization file `run_gptq.py` is finished and commented.
+    - `qwen` VLLM implementation file `vllm_wrapper.py` is finished and commented.
 
 
 ## Future Works

@@ -48,16 +48,25 @@ if __name__ == "__main__":
     
     
     quantize_config = BaseQuantizeConfig(
-        
+        bits = args.bits,  # 量化位数（4表示4位整型）
+        group_size = args.group_size,
+        damp_percent=0.01,  # 阻尼系数（用于平滑Hessian矩阵计算）
+        # # 禁用激活降序【descendant activations】排列（加速推理但可能轻微影响精度）
+        desc_act=False,  # set to False can significantly speed up inference but the perplexity may slightly bad
+        static_groups=False, # 使用动态分组替代静态分组
+        sym=True,    # 使用对称量化（量化范围对称于0点）
+        true_sequential=True,   # 按实际层顺序执行量化
+        model_name_or_path=None,   # 模型路径占位符（继承父类参数）
+        model_file_base_name="model" # 量化模型文件基础名称
     )
     
     
-    tokenizer = AutoTokenizer.from_pretrained()
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     
     tokenizer.pad_token_id = tokenizer.eod_id
     
     
-    data = preprocess()
+    data = preprocess(json.load(open(args.data_path)), tokenizer, args.max_len)
     
     
     model = AutoGPTQForCausalLM.from_pretrained(
@@ -67,19 +76,11 @@ if __name__ == "__main__":
         trust_remote_code=True
     )
     
-    
-    
     logging.basicConfig(
-        
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s", level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S"
     )
-    
-    
-    
-    model.quantize()
-    
-    
-    
-    model.save_quantized()
-    
-    
-    tokenizer.save_quantized()
+
+    model.quantize(data, cache_examples_on_gpu=False)
+
+    model.save_quantized(args.out_path, use_safetensors = True)
+    tokenizer.save_quantized(args.out_path)
