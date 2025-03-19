@@ -160,6 +160,7 @@ def make_context(
             current_context_size = (
                 len(system_tokens) + len(next_context_tokens) + len(context_tokens)
             )
+            
             if current_context_size < max_window_size:
                 context_tokens = next_context_tokens + context_tokens
                 raw_text = prev_chat + raw_text
