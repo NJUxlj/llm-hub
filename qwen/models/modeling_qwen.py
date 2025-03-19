@@ -408,10 +408,22 @@ class QWenAttention(nn.Module):
 
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
-        pass
+        '''
+        tensor.shape = (batch_size, seqlen, hidden_size)
+        '''
+        
+        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+        tensor = tensor.view(new_shape)
+        return tensor
     
     def _merge_heads(self, tensor, num_heads, attn_head_size):
-        pass
+        '''
+        tensor.shape = (batch_size, seqlen, num_heads,  attn_head_size)
+        '''
+        
+        new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
+        tensor = tensor.view(new_shape)
+        return tensor
     
 
 
@@ -439,12 +451,111 @@ class QWenAttention(nn.Module):
         
         
         
+        kv_seq_len = hidden_states.size()[1]   # 使用 input sequence size 初始化
         
-        
-        rotary_pos_emb = self.rotary_emb(
+        if layer_past:
+            # layer past[0] shape: bs * seq_len * head_num * dim
+            kv_seq_len += layer_past[0].size()[1]
             
-        )
+            
+        if (
+            self.use_dynamic_ntk 
+            and kv_seq_len == hidden_states.size()[1]
+            and not self.training
+        ):
+            # 假设 kv_seq = 1000, seq_len = 500
+            context_value = math.log(kv_seq_len/self.seq_length, 2) + 1
+            ntk_alpha =  2**math.ceil(context_value) -1
+            ntk_alpha = max(ntk_alpha, 1)
+            self._ntk_cached = ntk_alpha
+            
+        else:
+            ntk_alpha = self._ntk_cached    
+
+        # 计算一个 pos-freq的矩阵 shape = (kv_seq_len, dim), 它由两个 (kv_seq_len, dim//2) 拼接而成
+        rotary_pos_emb = self.rotary_emb.forward(
+            kv_seq_len, ntk_alpha=ntk_alpha
+        ).to(hidden_states.device)
         
+        
+        if rotary_pos_emb is not None:
+            if isinstance(rotary_pos_emb, tuple):
+                rotary_pos_emb= rotary_pos_emb
+            else:
+                rotary_pos_emb = (rotary_pos_emb,) * 2
+                
+                
+                
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            # Slice the pos emb for current inference
+            
+            
+            
+            
+        if layer_past is not None:
+            past_key, past_value = layer_past[0], layer_past[1]
+            
+            # 拼接历史和现在
+            
+            key = torch.cat((past_key,key), dim=1)
+            value = torch.cat((past_value, value), dim=1)
+            
+        if use_cache:
+            present = (key, value)
+        else:
+            present = None
+            
+        if self.use_logn_attn and not self.training:
+            if self.logn_tensor.device != query.device or self.logn_tensor.dtype != query.dtype:
+                self.logn_tensor = self.logn_tensor.to(query.device).type_as(query)
+
+            seq_start = key.size()[1] - query.size()[1]
+            seq_end = key.size()[1]
+            logn_tensor = self.logn_tensor[:, seq_start:seq_end, :, :]
+            query = query * logn_tensor.expand_as(query)
+
+
+        if (
+            self.use_flash_attn
+            and flash_attn_unpadded_func is not None
+            and not self.is_fp32
+            and query.is_cuda
+        ):
+            q, k, v = query, key, value
+            
+            context_layer = self.core_attention_flash.forward(q, k, v)
+            
+            context_layer = rearrange(
+                context_layer, "b s h d -> b s (h d)").contiguous()
+        else:
+            query = query.permute(0, 2, 1, 3)
+            key = key.permute(0, 2, 3, 1)   
+            value = value.permute(0, 2, 1, 3)
+            
+            attn_output, attn_weight = self._attn(
+                query, key, value, attention_mask, head_mask
+            )
+            
+            context_layer = self._merge_heads(
+                attn_output, self.num_heads, self.head_dim
+            )
+            
+        attn_output = self.c_proj(attn_output)
+        outputs = (attn_output, present)
+        
+        if output_attentions:
+            if (
+                self.use_flash_attn 
+                and flash_attn_unpadded_func is not None
+                and not self.is_fp32    
+            ):
+                raise ValueError("Can not output attentions while using the flash attention~~~")
+                
+            else:
+                outputs += (attn_weight,)
+
+        return outputs
 
 
 
@@ -582,14 +693,39 @@ class QWenPreTrainedModel(PreTrainedModel):
     
     def _init_weights(self, module):
         """Initialize the weights."""
-        pass
-    
-    
-    
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(
+                mean=0.0,
+                std = self.config.initializer_range
+            )
+            
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(
+                mean=0.0,
+                std = self.config.initializer_range
+            )
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        
+        elif isinstance(module, RMSNorm):
+            module.weight.data.fill_(1.0)
+        
+        for name, p in module.named_parameters():
+            if name =="c_proj.weight":
+                p.data.normal_(
+                    mean=0.0,
+                    std = (
+                        self.config.initializer_range
+                        / math.sqrt(2 * self.config.n_layers)
+                    )
+                )
+
     
     def _set_gradient_checkpointing(self, module, value = False):
         if isinstance(module, QWenModel):
-            module.graadient_checkpointing = value
+            module.gradient_checkpointing = value
         
     
     
@@ -642,6 +778,15 @@ class QWenModel(QWenPreTrainedModel):
         )
         
         self.post_init()
+        
+        
+    def get_input_embeddings(self):
+        return self.wte
+    
+    
+    def set_input_embedding(self, value):
+        self.wte = value
+    
         
         
     def forward(
@@ -843,20 +988,95 @@ class QWenModel(QWenPreTrainedModel):
 
 class QWenLMHeadModel(QWenPreTrainedModel):
     
+    _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.rotary_emb\.inv_freq"]
+    _keys_to_ignore_on_load_unexpected = [r"h\.\d+\.attn\.masked_bias"]
+
     
-    
-    def __init__(self, config):
+    def __init__(self, config: QWenConfig):
         super().__init__(config)
         assert (
             config.bf16+config.fp16+config.fp32 <=1
         ), "Only one of \"bf16\", \"fp16\", \"fp32\" can be true"
 
+        autoset_precision = config.bf16 + config.fp16 + config.fp32 
+        
+        if autoset_precision:
+            pass
+        
+        if config.bf16 and SUPPORT_CUDA and not SUPPORT_BF16:
+            logger.warn(
+                "Your device does NOT seem to support bf16, you can switch to fp16 or fp32 by by passing fp16/fp32=True in \"AutoModelForCausalLM.from_pretrained\"."
+            )
+        
+        if config.fp16 and SUPPORT_CUDA and not SUPPORT_FP16:
+            logger.warn(
+                "Your device does NOT seem to support fp16, you can switch to fp32 by by passing fp32=True in \"AutoModelForCausalLM.from_pretrained\"."
+            )
+            
+        if config.fp32:
+            if SUPPORT_BF16:
+                pass
+            elif SUPPORT_FP16:
+                pass
+            
+        if config.use_flash_attn == "auto":
+            pass
+        
+        
+        if config.use_flash_attn and config.fp32:
+            logger.warn(
+                
+            )
+            
+        if config.use_flash_attn:
+            global apply_rotary_emb_func, rms_norm, flash_attn_unpadded_func
+            
+            try:   
+                from flash_attn.layers.rotary import apply_rotary_emb_func as __apply_rotary_emb_func 
+                apply_rotary_emb_func  =__apply_rotary_emb_func
+            except ImportError as e:
+                logger.warn(
+                    "Warning: import flash_attn rotary fail, please install FlashAttention rotary to get higher efficiency "
+                    "https://github.com/Dao-AILab/flash-attention/tree/main/csrc/rotary"
+                )
+        
+            try:
+                from flash_attn.ops.rms_norm import rms_norm as __rms_norm
+                rms_norm = __rms_norm
+            except ImportError:
+                logger.warn(
+                    "Warning: import flash_attn rms_norm fail, please install FlashAttention layer_norm to get higher efficiency "
+                    "https://github.com/Dao-AILab/flash-attention/tree/main/csrc/layer_norm"
+                )
+                
+                
+            try:
+                from flash_attn.flash_attn_interface import flash_attn_unpadded_func as __flash_attn_unpadded_func
+                flash_attn_unpadded_func = __flash_attn_unpadded_func
+            except ImportError:
+                logger.warn(
+                    "Warning: import flash_attn fail, please install FlashAttention to get higher efficiency "
+                    "https://github.com/Dao-AILab/flash-attention"
+                )
+        
+        
+        
+        
         self.transformer:QWenModel = QWenModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
-    
+        if config.bf16:
+            self.transformer.bfloat16()
+            self.lm_head.bfloat16()
+        if config.fp16:
+            self.transformer.half()
+            self.lm_head.half()
+   
+        self.post_init()
+        
+        
     def get_output_embeddings(self):
-            return self.lm_head
+        return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
@@ -864,7 +1084,43 @@ class QWenLMHeadModel(QWenPreTrainedModel):
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs
     ):
-        pass
+        token_type_ids = kwargs.get("token_type_ids", None)
+        if past_key_values:
+            input_ids = input_ids[:, -1].unsqueeze(-1) # 取最后一个token
+            
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
+        
+        attention_mask = kwargs.get("attention_mask", None)
+        position_ids = kwargs.get("position_ids", None)
+        
+        # 从atterntion_mask 中推导出position_ids
+        if attention_mask is not None and position_ids is not None:
+            position_ids = attention_mask.long().cumsum(-1)-1
+            position_ids.masked_fill(attention_mask==0, 1)
+            if past_key_values:
+                position_ids = position_ids[:,-1].unsqueeze(-1)
+        else:
+            position_ids = None
+            
+            
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}  
+        else:
+            model_inputs = {"input_ids": input_ids}
+            
+            
+        model_inputs.update({
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,   
+        })
+        
+        
+        return model_inputs
+        
     
     
     
