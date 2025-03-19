@@ -1147,18 +1147,39 @@ class QWenLMHeadModel(QWenPreTrainedModel):
         
         
         transformer_outputs = self.transformer.forward(
-            
+            input_ids = input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
         )
         
         hidden_states = transformer_outputs[0]
         
+        lm_logits = self.lm_head(hidden_states) # 映射到词表大小
+        
+        loss = None
+        if labels is not None:
+            labels = labels.to(lm_logits.device)
+            shift_logits = lm_logits[... , :-1,:].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(), shift_labels.view()
+            )
+        
         if not return_dict:
-            pass
-        
-        
-        
-        
-        
+            output = (lm_logits, ) + transformer_outputs[1:]
+            return ((loss, ) + output) if loss is not None else output
+         
         return CausalLMOutputWithPast(
             loss=loss,
             logits=lm_logits,
