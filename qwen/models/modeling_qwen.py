@@ -1001,7 +1001,23 @@ class QWenLMHeadModel(QWenPreTrainedModel):
         autoset_precision = config.bf16 + config.fp16 + config.fp32 
         
         if autoset_precision:
-            pass
+            
+            if SUPPORT_BF16:
+                logger.warn(
+                        "The model is automatically converting to bf16 for faster inference. "
+                        "If you want to disable the automatic precision, please manually add bf16/fp16/fp32=True to \"AutoModelForCausalLM.from_pretrained\"."
+                    )
+                config.bf16=True
+            
+            elif SUPPORT_FP16:
+                logger.warn(
+                        "The model is automatically converting to fp16 for faster inference. "
+                        "If you want to disable the automatic precision, please manually add bf16/fp16/fp32=True to \"AutoModelForCausalLM.from_pretrained\"."
+                    )
+                config.fp16=True
+                
+            else:
+                config.fp32 = True
         
         if config.bf16 and SUPPORT_CUDA and not SUPPORT_BF16:
             logger.warn(
@@ -1015,22 +1031,27 @@ class QWenLMHeadModel(QWenPreTrainedModel):
             
         if config.fp32:
             if SUPPORT_BF16:
-                pass
+                logger.warn("Your device support faster inference by passing bf16=True in \"AutoModelForCausalLM.from_pretrained\".")
             elif SUPPORT_FP16:
-                pass
+                logger.warn("Your device support faster inference by passing fp16=True in \"AutoModelForCausalLM.from_pretrained\".")
             
         if config.use_flash_attn == "auto":
-            pass
+            if config.bf16 or config.fp16:
+                logger.warn(
+                    "Try importing flash-attention for faster inference..."
+                )
+                config.use_flash_attn = True
+            else:
+                config.use_flash_attn = False
         
         
         if config.use_flash_attn and config.fp32:
             logger.warn(
-                
+                "Flash attention will be disabled because it does NOT support fp32."
             )
             
         if config.use_flash_attn:
             global apply_rotary_emb_func, rms_norm, flash_attn_unpadded_func
-            
             try:   
                 from flash_attn.layers.rotary import apply_rotary_emb_func as __apply_rotary_emb_func 
                 apply_rotary_emb_func  =__apply_rotary_emb_func
@@ -1192,9 +1213,26 @@ class QWenLMHeadModel(QWenPreTrainedModel):
         
         
     @staticmethod
-    def _reorder_cache():
-        pass
-    
+    def _reorder_cache(
+        past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
+    )->Tuple[Tuple[torch.Tensor]]:
+        '''
+        
+        beam_idx: 一条特定路径的序号
+        
+        典型应用场景：
+            在生成每个token后，当需要保留top_k候选序列（beam search）时，
+            通过该方法调整所有transformer层的缓存状态，使其与新的候选序列顺序保持一致。
+        '''
+
+        return tuple(
+            tuple(
+                past_state.index_select(dim=0, index = beam_idx.to(past_state.device)) # 在 batch_size 维选择前k个打分最高的序列所对应的历史记录
+                for past_state in layer_past   # 处理每个层的key/value状态对
+                
+            )
+                for layer_past in past_key_values   # 遍历每个transformer层的缓存
+        )
     
     
     
@@ -1216,27 +1254,65 @@ class QWenLMHeadModel(QWenPreTrainedModel):
             stop_words_ids = []
 
         raw_text, context_tokens = make_context(
-            
+            tokenizer,
+            query,
+            history=history,
+            system=system,
+            max_window_size=6144,
+            chat_format=self.generation_config.chat_format,            
         )
         
         
-        stop_words_ids.extend((
-            
+        stop_words_ids.extend(get_stop_words_ids(
+            self.generation_config.chat_format, tokenizer
         ))
         
-        if stream:
-            pass
+        input_ids = torch.tensor().to(self.device)
         
+        if stream:
+            assert self.generation_config.chat_format == "chatml"
+            from transformers_stream_generator.main import NewGenerationMixin, StreamGenerationConfig
+            
+            # self.__class__ 会返回当前实例所属的类对象，相当于 type(self)。这在动态获取类类型时非常有用。
+            # 这实际是在运行时动态修改当前类的 generate 方法，将其替换为 NewGenerationMixin 的 generate 方法。所有该类的实例都会继承这个新方法。
+            self.__class__.generate = NewGenerationMixin.generate
+            self.__class__.sample_stream = NewGenerationMixin.sample_stream
+            stream_config = StreamGenerationConfig(**self.generation_config.to_dict(), do_stream=True)
+            
+            def stream_generator():
+                outputs = []
+                for token in self.generate(
+                        input_ids, 
+                        return_dict_in_generate = False,
+                        generation_config = stream_config,
+                        **kwargs
+                    ): # generate是一个异步输出的函数
+                    outputs.append(token.item())
+                    
+                    if outputs[-1] in [tokenizer.im_end_id, tokenizer.im_start_id]:
+                        break
+                    
+                    yield tokenizer.decode(outputs, skip_special_tokens=True)
+                         
+            return stream_generator()
         
         
         else:
             outputs = self.generate(
-                
+                input_ids,
+                stop_words_ids = stop_words_ids,
+                return_dict_in_generate = False,
+                **kwargs,
             )
             
             
             response = decode_tokens(
-                
+                outputs[0],
+                tokenizer,
+                raw_text_len= len(raw_text),
+                context_length=len(context_tokens),
+                chat_format=self.generation_config.chat_format,
+                verbose=False,
             )
             
             
