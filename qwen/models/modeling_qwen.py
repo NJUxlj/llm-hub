@@ -1198,18 +1198,113 @@ class QWenLMHeadModel(QWenPreTrainedModel):
     
     
     
-    def chat(self):
-        pass
-    
-    
-    
-    
-    
-    def generate(self):
-        pass
+    def chat(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        query: str,
+        history: Optional[HistoryType],
+        system: str = "You are a helpful assistant.",
+        append_history: bool = True,
+        stream: Optional[bool] = False,
+        stop_words_ids: Optional[List[List[int]]] = None,
+        **kwargs,
+        )->Tuple[str, HistoryType]:
+        if history==None:
+            history = []
+            
+        if stop_words_ids == None:
+            stop_words_ids = []
 
+        raw_text, context_tokens = make_context(
+            
+        )
+        
+        
+        stop_words_ids.extend((
+            
+        ))
+        
+        if stream:
+            pass
+        
+        
+        
+        else:
+            outputs = self.generate(
+                
+            )
+            
+            
+            response = decode_tokens(
+                
+            )
+            
+            
+            if append_history:
+                history.append((query, response))
+                
+                
+                
+        return response, history
+    
+    
+    
+    
+    
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        prefix_allowed_tokens_fn: Optional[
+            Callable[[int, torch.Tensor], List[int]]
+        ] = None,
+        synced_gpus: Optional[bool] = None,
+        streamer: Optional["BaseStreamer"] = None,
+        **kwargs,
+        )-> Union[GenerateOutput, torch.LongTensor]:
+        
+        '''
+        在Hugging Face Transformers库的生成方法中，synced_gpus参数主要用于处理多GPU并行生成的情况。具体来说：
 
+        应用场景：主要用于BLOOM等需要模型并行的大型模型
+        
+        作用机制：
+            当设置为True时，会强制各GPU在生成过程中保持同步
+            防止模型并行时不同GPU生成不同步导致的问题
+            在每一步生成时执行torch.cuda.synchronize()
+        '''
+        
+        # Process stop_words_ids.
+        stop_words_ids = kwargs.pop("stop_words_ids", None)
+        if stop_words_ids is None and generation_config is not None:
+            stop_words_ids = getattr(generation_config, "stop_words_ids", None)
+        if stop_words_ids is None:
+            stop_words_ids = getattr(self.generation_config, "stop_words_ids", None)
 
+        
+        if stop_words_ids is not None:
+            stop_words_logits_processor = StopWordsLogitsProcessor(
+                stop_words_ids=stop_words_ids,
+                eos_token_id=self.generation_config.eos_token_id,
+            )
+            
+            if logits_processor is None:
+                logits_processor = LogitsProcessorList([stop_words_logits_processor])
+            else:
+                logits_processor.append(stop_words_logits_processor)
+
+        return super().generate(
+            inputs,
+            generation_config,
+            logits_processor,
+            stopping_criteria,
+            prefix_allowed_tokens_fn,
+            synced_gpus,
+            streamer,
+            **kwargs,
+        )
 
 
 
