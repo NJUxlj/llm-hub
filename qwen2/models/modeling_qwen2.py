@@ -258,27 +258,83 @@ class Qwen2RotaryEmbedding(nn.Module):
          # BC: "rope_type" was originally "type"
          
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            pass
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
         else:
-            pass
-        
-        
+            self.rope_type = 'default'
+            
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
         self.config = config
         
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[]
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        
+        inv_freq, attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer(name = "inv_freq", tensor=inv_freq, persistent=False)
+        self.original_inv_freq = inv_freq
         
         
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
         
+        seq_len = torch.max(position_ids) + 1
         
-    def _dynamic_frequency_update(self):
-        pass
+        if seq_len > self.max_seq_len_cached:
+            inv_freq, self.attention_scalling = self.rope_init_fn(self.config, device, seq_len = seq_len)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            
+            self.max_seq_len_cached=  seq_len
+            
+            
+            
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cachedw = self.original_max_seq_len
+        
     
     
     
     @torch.no_grad()
-    def forward(self):
-        pass    
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            # 根据当前的序列长度来动态更改 inv_freq 这个 pos-freq矩阵
+            self._dynamic_frequency_update(position_ids, x.device)
+            
+        # 扩展频率倒数的维度：[dim] -> [batch_size, dim, 1]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        # 扩展位置ID的维度：[batch_size, seq_len] -> [batch_size, 1, seq_len]
+        position_ids_expanded = position_ids[:, None, :].float()    
+
+        # 强制使用 fp32计算， 某些设别如 mps存在精度问题
+        device_type = x.device.type
         
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        
+        # 禁用自动混合精度
+        with torch.autocast(device_type = device_type, enabled= False):
+            # 计算旋转频率：[batch_size, dim, 1] @ [batch_size, 1, seq_len] -> [batch_size, dim, seq_len]
+            # @ 相当于torch.matmul()
+            freqs = (inv_freq_expanded.to(x.device) @ position_ids_expanded)
+            
+            freqs = freqs.transpose(1,2) # shape = [batch_size, seq_len, dim]
+            emb = torch.cat([freqs, freqs], dim=-1)
+            sin = emb.sin()
+            cos = emb.cos()
+            
+        
+        cos = cos * self.attention_scalling
+        sin = sin * self.attention_scalling
+            
+        return cos.to(x.dtype), sin.to(x.dtype)
 
 
 

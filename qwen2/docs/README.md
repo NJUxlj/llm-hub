@@ -1,0 +1,2 @@
+- 在线查看Qwen2.5的文档
+  - https://qwen.readthedocs.io/en/latest/
