@@ -1267,7 +1267,7 @@ class QWenLMHeadModel(QWenPreTrainedModel):
             self.generation_config.chat_format, tokenizer
         ))
         
-        input_ids = torch.tensor().to(self.device)
+        input_ids = torch.tensor([context_tokens]).to(self.device)
         
         if stream:
             assert self.generation_config.chat_format == "chatml"

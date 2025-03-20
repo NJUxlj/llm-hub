@@ -106,7 +106,7 @@ def get_batch(context_tokens: torch.LongTensor, eod_id: int):
     return tokens, attention_mask, position_ids
 
 
-def get_stop_words_ids(chat_format, tokenizer):
+def get_stop_words_ids(chat_format, tokenizer)->List[List[int]]:
     if chat_format == "raw":
         stop_words_ids = [tokenizer.encode("Human:"), [tokenizer.eod_id]]
     elif chat_format == "chatml":
@@ -234,17 +234,21 @@ def _decode_chatml(
     return_end_reason: bool = False,
 ):
     end_reason = f"Gen length {len(tokens)}"
+    # 定位结束标记：从上下文长度开始扫描，找到第一个出现的结束标记（eod_token_ids）
     eod_token_idx = context_length
     for eod_token_idx in range(context_length, len(tokens)):
         if tokens[eod_token_idx] in eod_token_ids:
+            # 结束原因是生成了某个停止符
             end_reason = f"Gen {tokenizer.decode([tokens[eod_token_idx]])!r}"
             break
-
+    # 截取新生成部分：跳过原始prompt长度（raw_text_len），并排除结束标记之后的内容
     trim_decode_tokens = tokenizer.decode(tokens[:eod_token_idx])[raw_text_len:]
     if verbose:
-        print("\nRaw Generate w/o EOD:", tokenizer.decode(tokens)[raw_text_len:])
+        print("\nRaw Generate w/o EOD:", tokenizer.decode(tokens)[raw_text_len:]) # 包含结束标记的原始输出
         print("\nRaw Generate:", trim_decode_tokens)
         print("\nEnd Reason:", end_reason)
+        
+    # 后处理：移除预定义的停止词并整理格式
     for stop_word in stop_words:
         trim_decode_tokens = trim_decode_tokens.replace(stop_word, "").strip()
     trim_decode_tokens = trim_decode_tokens.strip()
@@ -344,6 +348,9 @@ class StopWordsLogitsProcessor(LogitsProcessor):
     def __call__(
         self, input_ids: torch.LongTensor, scores: torch.FloatTensor
     ) -> torch.FloatTensor:
+        # 核心控制方法：当检测到停止词时，强制生成终止符（eos_token_id）
+        # 通过将 eos_token_id 的 logits 设为极大值（32768）来实现
+        # scores.shape = [batch_size, vocab_size]
         stopped_samples = self._calc_stopped_samples(input_ids)
         for i, should_stop in enumerate(stopped_samples):
             if should_stop:
@@ -351,6 +358,10 @@ class StopWordsLogitsProcessor(LogitsProcessor):
         return scores
 
     def _tokens_match(self, prev_tokens: torch.LongTensor, tokens: List[int]) -> bool:
+        # 令牌匹配检测：判断当前生成的 tokens 是否包含停止词序列
+        # 通过比较最后 N 个 tokens 实现（N 为停止词序列长度）
+        # 示例：prev_tokens = [1,2,3,4], tokens = [3,4] → 返回 True
+        
         if len(tokens) == 0:
             # if bad word tokens is just one token always ban it
             return True
@@ -364,6 +375,8 @@ class StopWordsLogitsProcessor(LogitsProcessor):
             return False
 
     def _calc_stopped_samples(self, prev_input_ids: Iterable[int]) -> Iterable[int]:
+        # 批量计算：判断每个样本是否命中任意停止词
+        # 返回布尔列表 [True, False, ...] 表示各样本是否需要停止
         stopped_samples = []
         for prev_input_ids_slice in prev_input_ids:
             match = False
