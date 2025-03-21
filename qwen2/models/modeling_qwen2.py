@@ -549,10 +549,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
         
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
-            
-            
-            
+            past_key_values = DynamicCache()  
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length()
             cache_position = torch.arange(
@@ -563,20 +560,22 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
             
-        causal_mask = self.update_causal_mask(
+        causal_mask = self._update_causal_mask(
             
         )
         
         hidden_states = inputs_embeds
         
-        position_embeddings = self.rotary_emb()
+        # cos, sin 矩阵元组
+        position_embeddings = self.rotary_emb.forward(hidden_states, position_ids)
         
         
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attn = () if output_attentions else None
         
-        for decoder_layer in self.layers[]:
+        for decoder_layer in self.layers[:self.config.num_hidden_layers]:
+            decoder_layer:Qwen2DecoderLayer
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
                 
@@ -584,19 +583,222 @@ class Qwen2Model(Qwen2PreTrainedModel):
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
-                    
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
                 )
             else:
-                layer_outputs = decoder_layer(
-                    
+                layer_outputs = decoder_layer.forward(
+                    hidden_states,
+                    attention_mask = causal_mask,
+                    position_ids = position_ids,
+                    past_key_value = past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **flash_attn_kwargs,
                 )
                 
             hidden_states = layer_outputs[0]
+            
+            if output_attentions:
+                all_self_attn += (layer_outputs[1], )
+                
+        hidden_states = self.norm(hidden_states)
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
         
+        output = BaseModelOutputWithPast(
+            last_hidden_state = hidden_states,
+            past_key_values = past_key_values if use_cache else None,
+            hidden_states = all_hidden_states,
+            attentions = all_self_attn
+        )
+
+        return output if return_dict else output.to_tuple()
+        
+        
+    def _update_causal_mask(
+        self,
+        attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_key_values: Cache,
+        output_attentions: bool,
+        
+        ):
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            
+        )
+        
+        
+    @staticmethod
+    def _prepare_4d_causal_attention_mask_with_cache_position(
+        
+        
+    ):
+        pass
+
+
+
+
+class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
 class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
-    pass
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}  # tensor并行：按列切分
+    _pp_plan = {"lm_head": (["hidden_states"],["logits"])}   # 流水线并行：按层切分
+    
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = Qwen2Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        # 舒适化权重 + 后处理
+        self.post_init()
+    
+    
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+    
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+        
+        
+    def get_output_embeddings(self):
+        return self.lm_head
+    
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+    
+    
+    def set_decoder(self, decoder):
+        self.model = decoder
+        
+    def get_decoder(self):
+        return self.model
+
+    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
+    @add_start_docstrings_to_model_forward(QWEN2_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)   # 自动从CausalLMOutputWithPast类提取返回值的字段描述，将标准的返回类型文档插入到方法的docstring中
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor]= None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        
+        cache_position:Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = None,
+        **kwargs: Unpack[KwargsForCausalLM], 
+    )-> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+            logits_to_keep (`int` or `torch.Tensor`, *optional*):
+                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
+                This is useful when using packed tensor format (single dimension for batch and sequence length).
+
+            Unpack的作用：
+                在Python里，Unpack 一般是用来处理类型注解的，其目的是把一个复合类型解包成单个的类型。
+                在当前代码里，Unpack[FlashAttentionKwargs] 可能是要把 FlashAttentionKwargs 类型的参数解包成一个个独立的参数，
+                这样就能在函数调用时直接传入这些参数，而无需先把它们封装成一个类型。
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, Qwen2ForCausalLM
+
+        >>> model = Qwen2ForCausalLM.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        
+        
+        hidden_states = outputs[0]
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        # If logits_to_keep is an integer: Creates a slice object to get the last logits_to_keep tokens (e.g., slice(-3, None) would keep last 3 positions)
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices ,:])  # 只取几个特定的token来计算loss
+        
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits = logits, labels = labels, vocab_size = self.config.vocab_size, **kwargs)
+        
+        if not return_dict:
+            output = (logits,) + output[1:]
+            return (loss, )+output if loss is not None else output 
+        
+        return CausalLMOutputWithPast(
+            loss = loss,
+            logits = logits,
+            past_key_values = outputs.past_key_values,
+            hidden_states = outputs.hidden_states,
+            attentions = outputs.attentions 
+        )
+
+    
 
 
 
